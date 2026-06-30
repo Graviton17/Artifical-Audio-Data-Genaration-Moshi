@@ -1,0 +1,15 @@
+{
+  "conversation_id": "current_affairs_gu_01",
+  "language": "gu",
+  "speakers": {
+    "user1": { "voice": "A clear, warm female voice speaking natural Gujarati at a moderate pace." },
+    "user2": { "voice": "A calm male voice speaking natural Gujarati at a moderate pace." }
+  },
+  "turns": [
+    { "speaker": "user1", "text": "નમસ્તે, આજે આપણે આ વર્ષના બજેટ વિશે વાત કરીશું." },
+    { "speaker": "user2", "text": "હા, ચોક્કસ. મને લાગે છે કે આ વખતે ખર્ચ વધ્યો છે.", "gap": 0.3 },
+    { "speaker": "user1", "text": "બરાબર, અને ખાસ કરીને શિક્ષણ પર ભાર મૂકવામાં આવ્યો છે.", "overlap": 0.4 },
+    { "speaker": "user2", "text": "એ સારી વાત છે, પણ આરોગ્ય વિશે શું?", "gap": 0.2 },
+    { "speaker": "user1", "text": "આરોગ્ય માટે પણ ફાળવણી વધારવામાં આવી છે.", "overlap": 0.5 }
+  ]
+}

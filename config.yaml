@@ -1,0 +1,44 @@
+# datagen configuration. All values shown are the defaults from datagen/config.py.
+sample_rate: 24000          # Mimi operates at 24 kHz; output stereo is written at this rate
+device: cuda
+input_dir: conversations    # directory of conversation .json scripts
+out_dir: dataset
+cache_dir: .cache
+
+tts:
+  # `name` selects the concrete BaseTTS implementation in datagen/factory.py.
+  # Adding a new model is a one-line registry change there; the rest of the
+  # pipeline is model-agnostic.
+  name: indic_mio
+  # NOTE: `SPRINGLab/Indic-Mio` is wired as requested. If this id does not
+  # resolve on HuggingFace, swap it for a verified one, e.g.:
+  #   ai4bharat/indic-parler-tts   (multilingual: gu, hi, + ~20 Indic langs)
+  #   ai4bharat/IndicF5            (multilingual F5, 24 kHz, voice cloning)
+  #   SPRINGLab/F5-Hindi-24KHz     (SPRINGLab F5, Hindi only)
+  model_id: SPRINGLab/Indic-Mio
+  default_language: gu
+  target_sr: 24000            # synthesized clips are resampled to this before scheduling
+
+aligner:
+  # `forced` = CTC/MMS forced alignment of the KNOWN text (no ASR, no transcription
+  # guessing). `heuristic` = deterministic char/phoneme-proportional timing.
+  name: forced
+  model: MahmoudAshraf/mms-300m-1130-forced-aligner
+  language: gu
+  fallback_heuristic: true   # if forced alignment errors on a clip, fall back to heuristic
+
+schedule:
+  default_gap_sec: 0.25      # silence inserted between turns when no gap/overlap is given
+  max_overlap_sec: 3.0       # clamp: a turn may start at most this many sec before prev ends
+  lead_silence_sec: 0.1      # silence at the very start of the conversation timeline
+
+augment:
+  channel_swap: true         # emit both user1=agent and user2=agent variants
+
+labels:
+  main_label: SPEAKER_MAIN   # agent channel (channel 0); interleaver ties text to this
+  user_label: SPEAKER_OTHER  # other speaker (channel 1)
+
+cleanup:
+  loudness_lufs: -23.0       # peak/loudness target; applied per channel before stereo mux
+  peak_limit_db: -1.0

@@ -1,0 +1,14 @@
+# Core
+numpy>=1.24
+pyyaml>=6.0
+soundfile>=0.12
+sphn==0.1.12          # duration reader used by the manifest (matches Data-Processing-Moshi)
+
+# ML / TTS / alignment
+torch>=2.1
+transformers>=4.40
+ctc-forced-aligner    # multilingual (MMS-based) forced alignment of KNOWN text -> word timings
+                      # if unavailable for your platform, the HeuristicAligner fallback is used.
+
+# The concrete TTS model (IndicMioTTS) pulls its own weights at runtime via transformers.
+# Swap the model id in config.yaml if `SPRINGLab/Indic-Mio` does not resolve.
