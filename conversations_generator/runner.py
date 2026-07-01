@@ -1,10 +1,11 @@
 """Orchestration for the conversation-generation pipeline.
 
 A single :class:`BaseLLM` is created once and shared by every agent, so switching
-provider (Groq by default) is one argument. Today the runner drives one stage —
-topic generation — but it's structured so later stages (conversation generation,
-validation) slot in as new methods on :class:`ConversationRunner` without
-changing how callers wire things up.
+provider (Groq by default) is one argument. The runner now drives three stages —
+topic generation, conversation generation, and manual timing validation — so
+every generated conversation is mechanically checked (overlap/interruption/
+backchannel timing, duration, turn-type distribution) before it's handed back
+to the caller.
 
     python -m conversations_generator.runner
 """
@@ -17,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from .agents import ConversationGeneratorAgent, TopicGeneratorAgent
+from .agents.conversation_validator_manual import ConversationValidatorManual, ValidationReport
 from .llm import BaseLLM
 from .models import CorpusInstance
 
@@ -42,13 +44,33 @@ def load_env(filename: str = ".env") -> None:
 
 
 class ConversationRunner:
-    """Drives the pipeline agents over a shared LLM, stage by stage."""
+    """Drives the pipeline agents over a shared LLM, stage by stage.
 
-    def __init__(self, llm: BaseLLM | None = None) -> None:
-        # Shared LLM: None lets each agent fall back to its own default (Groq).
+    Parameters
+    ----------
+    llm : BaseLLM | None
+        Shared LLM instance passed to every agent. ``None`` lets each agent
+        fall back to its own default (Groq).
+    validator : ConversationValidatorManual | None
+        Deterministic timing/overlap validator run after generation. Defaults
+        to ``ConversationValidatorManual()`` with its standard thresholds.
+    max_generation_attempts : int
+        How many times to regenerate the conversation if manual validation
+        reports errors (not just warnings) before giving up and returning the
+        last attempt anyway. Defaults to 1 (no retry).
+    """
+
+    def __init__(
+        self,
+        llm: BaseLLM | None = None,
+        validator: ConversationValidatorManual | None = None,
+        max_generation_attempts: int = 1,
+    ) -> None:
         self.llm = llm
         self.topic_agent = TopicGeneratorAgent(llm)
         self.conversation_agent = ConversationGeneratorAgent(llm)
+        self.validator = validator or ConversationValidatorManual()
+        self.max_generation_attempts = max(1, max_generation_attempts)
 
     # ------------------------------------------------------------------ #
     # Stage 1: topic
@@ -82,29 +104,74 @@ class ConversationRunner:
         )
 
     # ------------------------------------------------------------------ #
+    # Stage 3: manual validation
+    # ------------------------------------------------------------------ #
+    def validate_conversation(
+        self,
+        turns: list[dict[str, Any]],
+        time_field: str = "planned",
+    ) -> ValidationReport:
+        """Run the deterministic timing/overlap checks over generated turns.
+
+        See ``ConversationValidatorManual.validate`` for what's checked
+        (schema correctness, overlap symmetry, interruption/backchannel/
+        collision timing, total duration, turn-type distribution).
+        """
+        return self.validator.validate(turns, time_field=time_field)
+
+    # ------------------------------------------------------------------ #
     # Entry point
     # ------------------------------------------------------------------ #
     def run(self, **profile: Any) -> dict[str, Any]:
-        """Run the full pipeline: topic → conversation.
+        """Run the full pipeline: topic → conversation → manual validation.
 
-        Returns a dict with ``topic`` and ``turns`` keys.
+        Regenerates the conversation (same topic) up to
+        ``max_generation_attempts`` times if validation reports errors, then
+        returns the best attempt regardless of outcome so the caller can
+        decide what to do (log, discard, escalate, etc.).
+
+        Returns
+        -------
+        dict with keys:
+            topic : dict        — output of stage 1
+            turns : list[dict]  — output of stage 2 (last attempt)
+            validation : ValidationReport — output of stage 3 (last attempt)
+            attempts : int      — how many generation attempts were made
+            passed : bool       — True if the final attempt had no errors
         """
         topic = self.generate_topic(**profile)
-        turns = self.generate_conversation(topic, **profile)
-        return {"topic": topic, "turns": turns}
-    
+
+        turns: list[dict[str, Any]] = []
+        report: ValidationReport | None = None
+
+        for attempt in range(1, self.max_generation_attempts + 1):
+            turns = self.generate_conversation(topic, **profile)
+            report = self.validate_conversation(turns)
+            if not report.has_errors:
+                break
+
+        assert report is not None  # at least one attempt always runs
+        return {
+            "topic": topic,
+            "turns": turns,
+            "validation": report,
+            "attempts": attempt,
+            "passed": not report.has_errors,
+        }
+
+
 def read_corpus_instances(corpus_path: str) -> pd.DataFrame:
     """Read the corpus instances from a JSONL file and return as a DataFrame."""
     if not os.path.exists(corpus_path):
         raise FileNotFoundError(f"Corpus file not found: {corpus_path}")
-    
+
     df = pd.read_json(corpus_path, lines=True)
     return df
 
 
 def main() -> None:
     load_env()  # pull GROQ_API_KEY / GEMINI_API_KEY from .env
-    runner = ConversationRunner()
+    runner = ConversationRunner(max_generation_attempts=3)
 
     corpus_path = Path(__file__).resolve().parent / "data" / "corpus_instances.jsonl"
     corpus_df = read_corpus_instances(str(corpus_path))
@@ -114,9 +181,19 @@ def main() -> None:
     instance = CorpusInstance.from_dict(row)
 
     result = runner.run(**instance.to_profile())
-    topic, turns = result["topic"], result["turns"]
-    print(f"[Language: {instance.language} | Gender: {instance.gender_pair} | Type: {topic.get('conversation_type', 'unknown')}] {topic['title']}")
+    topic, turns, report = result["topic"], result["turns"], result["validation"]
+
+    print(
+        f"[Language: {instance.language} | Gender: {instance.gender_pair} | "
+        f"Type: {topic.get('conversation_type', 'unknown')}] {topic['title']}"
+    )
     print(turns)
+    print()
+    print(f"--- Manual validation (attempt {result['attempts']}/{runner.max_generation_attempts}) ---")
+    report.print()
+
+    if not result["passed"]:
+        print("\n⚠️  Conversation still failed manual validation after all retry attempts.")
 
 
 if __name__ == "__main__":
