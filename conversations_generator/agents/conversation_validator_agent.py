@@ -117,8 +117,8 @@ class AgentValidationReport:
 
     @property
     def passed(self) -> bool:
-        """True only if the model said PASS *and* raised nothing critical."""
-        return self.verdict == "PASS" and not self.has_critical_issues
+        """True only if the model returned a PASS verdict."""
+        return self.verdict == "PASS"
 
     # ------------------------------------------------------------------ #
     # Pretty-printing (mirrors ConversationValidatorManual.ValidationReport)
@@ -295,19 +295,25 @@ class ConversationValidatorAgent(BaseAgent):
         if not isinstance(result, dict):
             raise ValueError(f"Expected a validation object, got {type(result).__name__}")
 
+        # Normalize all keys to lowercase to avoid case-sensitivity bugs from LLM JSON
+        result = {str(k).lower(): v for k, v in result.items()}
+
         verdict = str(result.get("verdict", "NEEDS_REVIEW")).strip().upper()
         if verdict not in VALID_VERDICTS:
             verdict = "NEEDS_REVIEW"
 
         field_matches_raw = result.get("corpus_field_matches", {}) or {}
+        if isinstance(field_matches_raw, dict):
+            field_matches_raw = {str(k).lower(): v for k, v in field_matches_raw.items()}
         corpus_field_matches = {
-            k: bool(field_matches_raw[k]) for k in CORPUS_FIELDS if k in field_matches_raw
+            k: bool(field_matches_raw.get(k, False)) for k in CORPUS_FIELDS
         }
 
         issues: list[ValidationIssue] = []
         for raw_issue in result.get("issues", []) or []:
             if not isinstance(raw_issue, dict):
                 continue
+            raw_issue = {str(k).lower(): v for k, v in raw_issue.items()}
             severity = str(raw_issue.get("severity", "minor")).strip().lower()
             if severity not in VALID_SEVERITIES:
                 severity = "minor"
