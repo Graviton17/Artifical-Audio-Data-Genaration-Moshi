@@ -187,6 +187,7 @@ def main() -> None:
         f"[Language: {instance.language} | Gender: {instance.gender_pair} | "
         f"Type: {topic.get('conversation_type', 'unknown')}] {topic['title']}"
     )
+    print(f"Context: {topic.get('context', '')}")
     print(turns)
     print()
     print(f"--- Manual validation (attempt {result['attempts']}/{runner.max_generation_attempts}) ---")
