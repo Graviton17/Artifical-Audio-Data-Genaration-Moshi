@@ -1,11 +1,4 @@
-"""Agent that proposes conversation topics, one at a time.
-
-Each call to :meth:`run` produces a single topic (title + context) for a
-two-speaker spoken conversation. The agent remembers everything it has already
-generated in :attr:`history` and feeds those titles back into the prompt, so
-successive calls yield fresh, non-duplicate topics. The returned topic and its
-context are what the downstream ``conversation_generator_agent`` consumes.
-"""
+"""Agent that proposes conversation topics, one at a time."""
 
 from __future__ import annotations
 
@@ -18,26 +11,7 @@ from .base_agent import BaseAgent
 class TopicGeneratorAgent(BaseAgent):
     """Generate conversation topics one per call, avoiding past repeats."""
 
-    system_prompt = (
-        "You are a topic designer for a synthetic speech dataset. You invent "
-        "realistic topics for spontaneous, two-person spoken conversations (an "
-        "agent and a user talking naturally, as on a phone or voice-assistant "
-        "call).\n"
-        "\n"
-        "Each time you are called you produce EXACTLY ONE topic. You are shown the "
-        "topics already generated; your new topic must be clearly different from "
-        "all of them (no near-duplicates or overlapping themes).\n"
-        "\n"
-        "Rules:\n"
-        "- The topic must suit everyday spoken dialogue, not an essay or monologue.\n"
-        "- Match the requested language, emotional tone, and domain when given.\n"
-        "- 'title': short, 3-8 words.\n"
-        "- 'context': 2-4 sentences of grounding detail (setting, goal, who the "
-        "speakers are, what they discuss) that a writer can use to script the "
-        "conversation.\n"
-        "- Return ONLY a single JSON object with exactly the keys \"title\" and "
-        "\"context\". No prose, no markdown, no code fences."
-    )
+    prompt_name = "topic-generator-agent"
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
         super().__init__(llm)
@@ -54,12 +28,7 @@ class TopicGeneratorAgent(BaseAgent):
         extra_guidance: str | None = None,
         **overrides: Any,
     ) -> dict[str, str]:
-        """Generate the next single topic and append it to :attr:`history`.
-
-        Parameters mirror the corpus profile fields (see
-        ``data/corpus_instances.jsonl``) so topics can be steered per combination.
-        ``overrides`` pass through to the LLM (e.g. ``temperature``).
-        """
+        """Generate the next single topic and append it to :attr:`history`."""
         prompt = self._build_prompt(
             language=language,
             domain=domain,
@@ -67,8 +36,7 @@ class TopicGeneratorAgent(BaseAgent):
             user_emotion=user_emotion,
             extra_guidance=extra_guidance,
         )
-        # Ask the provider for strict JSON; the prompt already says "json" (a Groq
-        # json_object requirement). Callers can override via response_format=.
+
         overrides.setdefault("response_format", {"type": "json_object"})
         topic = self._normalize(self._generate_json(prompt, **overrides))
         self.history.append(topic)

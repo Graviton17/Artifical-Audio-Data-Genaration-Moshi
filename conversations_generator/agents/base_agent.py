@@ -1,10 +1,4 @@
-"""Base class for the conversation-generation agents.
-
-An agent pairs a fixed *system prompt* (its role and instructions) with a
-provider-agnostic :class:`BaseLLM`. Subclasses set :attr:`system_prompt` and
-implement :meth:`run`. The LLM defaults to Groq, so agents work out of the box
-given a ``GROQ_API_KEY``; inject any other :class:`BaseLLM` to switch providers.
-"""
+"""Base class for the conversation-generation agents."""
 
 from __future__ import annotations
 
@@ -12,22 +6,20 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from ..llm import BaseLLM, GroqLLM
+from ..prompts import resolve_system_prompt
 
 
 class BaseAgent(ABC):
-    """Common wiring shared by every agent.
+    """Common wiring shared by every agent."""
 
-    Subclasses provide a :attr:`system_prompt` describing their role and
-    implement :meth:`run`. Use :meth:`_generate` / :meth:`_generate_json` to call
-    the LLM with this agent's system prompt already applied.
-    """
-
-    # Role-specific instructions; overridden by each concrete agent.
-    system_prompt: str = ""
+    prompt_name: str | None = None
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
+        if not self.prompt_name:
+            raise ValueError(f"{type(self).__name__} must set a class-level prompt_name.")
         # Default provider is Groq; pass any BaseLLM to use a different one.
         self.llm = llm if llm is not None else GroqLLM()
+        self.system_prompt = resolve_system_prompt(self.prompt_name)
 
     @abstractmethod
     def run(self, *args: Any, **kwargs: Any) -> Any:
