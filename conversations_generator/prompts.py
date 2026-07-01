@@ -35,7 +35,7 @@ def _get_client() -> Any:
     return _client
 
 
-def resolve_system_prompt(prompt_name: str) -> str:
+def resolve_system_prompt(prompt_name: str) -> Any:
     """Fetch the Langfuse-managed text prompt named ``prompt_name``.
 
     Raises :class:`PromptResolutionError` if Langfuse isn't installed, isn't
@@ -56,4 +56,4 @@ def resolve_system_prompt(prompt_name: str) -> str:
         raise PromptResolutionError(
             f"Langfuse prompt {prompt_name!r} is not a text prompt."
         )
-    return prompt.prompt
+    return prompt

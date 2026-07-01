@@ -19,7 +19,7 @@ class BaseAgent(ABC):
             raise ValueError(f"{type(self).__name__} must set a class-level prompt_name.")
         # Default provider is Groq; pass any BaseLLM to use a different one.
         self.llm = llm if llm is not None else GroqLLM()
-        self.system_prompt = resolve_system_prompt(self.prompt_name)
+        self.langfuse_prompt = resolve_system_prompt(self.prompt_name)
 
     @abstractmethod
     def run(self, *args: Any, **kwargs: Any) -> Any:
@@ -29,8 +29,10 @@ class BaseAgent(ABC):
     # ------------------------------------------------------------------ #
     # Convenience wrappers that always apply this agent's system prompt
     # ------------------------------------------------------------------ #
-    def _generate(self, prompt: str, **overrides: Any) -> str:
-        return self.llm.generate(prompt, system=self.system_prompt, **overrides)
+    def _generate(self, prompt: str, system_vars: dict[str, Any] | None = None, **overrides: Any) -> str:
+        system = self.langfuse_prompt.compile(**(system_vars or {}))
+        return self.llm.generate(prompt, system=system, **overrides)
 
-    def _generate_json(self, prompt: str, **overrides: Any) -> Any:
-        return self.llm.generate_json(prompt, system=self.system_prompt, **overrides)
+    def _generate_json(self, prompt: str, system_vars: dict[str, Any] | None = None, **overrides: Any) -> Any:
+        system = self.langfuse_prompt.compile(**(system_vars or {}))
+        return self.llm.generate_json(prompt, system=system, **overrides)

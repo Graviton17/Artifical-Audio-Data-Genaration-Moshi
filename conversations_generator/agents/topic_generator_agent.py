@@ -2,10 +2,25 @@
 
 from __future__ import annotations
 
+import random
 from typing import Any
 
 from ..llm import BaseLLM
 from .base_agent import BaseAgent
+
+CONVERSATION_TYPES: list[str] = [
+    "Explain",
+    "Education",
+    "Sales",
+    "Inquiry",
+    "Day-to-day",
+    "Information-based",
+    "Life experience",
+    "Reasoning-based",
+    "Formal address",
+    "Interview",
+    "Emotion",
+]
 
 
 class TopicGeneratorAgent(BaseAgent):
@@ -22,6 +37,7 @@ class TopicGeneratorAgent(BaseAgent):
         self,
         *,
         language: str = "Hinglish",
+        conversation_type: str | None = None,
         agent_emotion: str | None = None,
         user_emotion: str | None = None,
         agent_accent: str | None = None,
@@ -30,6 +46,9 @@ class TopicGeneratorAgent(BaseAgent):
         **overrides: Any,
     ) -> dict[str, str]:
         """Generate the next single topic and append it to :attr:`history`."""
+        # Pick a random conversation type if none was explicitly provided.
+        chosen_type = conversation_type or random.choice(CONVERSATION_TYPES)
+
         prompt = self._build_prompt(
             language=language,
             agent_emotion=agent_emotion,
@@ -39,8 +58,11 @@ class TopicGeneratorAgent(BaseAgent):
             gender_pair=gender_pair,
         )
 
+        system_vars = {"conversation_type": chosen_type}
+
         overrides.setdefault("response_format", {"type": "json_object"})
-        topic = self._normalize(self._generate_json(prompt, **overrides))
+        topic = self._normalize(self._generate_json(prompt, system_vars=system_vars, **overrides))
+        topic["conversation_type"] = chosen_type  # track which type was used
         self.history.append(topic)
         return topic
 
