@@ -7,5 +7,6 @@ from .topic_generator_agent import TopicGeneratorAgent
 __all__ = [
     "BaseAgent",
     "ConversationGeneratorAgent",
+    "ConversationValidatorManual"
     "TopicGeneratorAgent",
 ]
