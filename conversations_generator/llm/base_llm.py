@@ -71,7 +71,7 @@ class BaseLLM(ABC):
         dynamic content into ``prompt`` before calling this method.
         Retries with exponential backoff on transient provider errors.
         """
-        messages: list[Message] = [{"role": "system", "content": prompt}]
+        messages: list[Message] = [{"role": "user", "content": prompt}]
 
         last_err: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
