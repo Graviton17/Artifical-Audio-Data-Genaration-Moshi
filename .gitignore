@@ -6,3 +6,4 @@ dataset/*.wav
 dataset/*.json
 dataset/*.jsonl
 !conversations/*.json
+.env
