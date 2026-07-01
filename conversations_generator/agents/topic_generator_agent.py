@@ -99,10 +99,16 @@ class TopicGeneratorAgent(BaseAgent):
             lines.append(f"Agent/user gender pair in sequence where M means Male and F means Female: {gender_pair}.")
 
         if self.history:
-            already = "\n".join(f"- {t['title']}" for t in self.history)
+            already = "\n".join(
+                f"- {t['title']} (type: {t.get('conversation_type', 'unknown')})"
+                for t in self.history
+            )
             lines.append(
-                "Topics already generated (do NOT repeat or closely resemble these):\n"
-                f"{already}"
+                "Topics already generated (do NOT repeat, closely resemble, "
+                "or use a similar theme/setting/scenario as any of these):\n"
+                f"{already}\n"
+                "IMPORTANT: Ensure maximum diversity in the themes, settings, and scenarios. "
+                "Avoid clustering around any single domain."
             )
 
         lines.append(

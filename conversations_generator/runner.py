@@ -82,13 +82,14 @@ def main() -> None:
     corpus_df = read_corpus_instances(str(corpus_path))
 
     # Pick one row and convert to a typed CorpusInstance.
-    row = corpus_df.iloc[0].to_dict()
+    row = corpus_df.iloc[148].to_dict()
     instance = CorpusInstance.from_dict(row)
 
     # .to_profile() returns only the kwargs the pipeline cares about.
-    topic = runner.run(**instance.to_profile())
-    print(f"[{instance.language} | {instance.gender_pair}] "
-          f"{topic['title']}\n{topic['context']}")
+    for i in range(1, 31):
+        topic = runner.run(**instance.to_profile())
+        print(f"[Run {i}/30 | {instance.language} | {instance.gender_pair} | {topic.get('conversation_type', 'unknown')}] "
+              f"{topic['title']}\n{topic['context']}\n")
 
 
 if __name__ == "__main__":
