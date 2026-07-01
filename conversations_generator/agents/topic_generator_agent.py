@@ -22,19 +22,18 @@ class TopicGeneratorAgent(BaseAgent):
         self,
         *,
         language: str = "Hinglish",
-        domain: str | None = None,
         agent_emotion: str | None = None,
         user_emotion: str | None = None,
-        extra_guidance: str | None = None,
+        agent_accent: str | None = None,
+        user_accent: str | None = None,
+        gender_pair: str | None = None,
         **overrides: Any,
     ) -> dict[str, str]:
         """Generate the next single topic and append it to :attr:`history`."""
         prompt = self._build_prompt(
             language=language,
-            domain=domain,
             agent_emotion=agent_emotion,
             user_emotion=user_emotion,
-            extra_guidance=extra_guidance,
         )
 
         overrides.setdefault("response_format", {"type": "json_object"})
@@ -53,23 +52,26 @@ class TopicGeneratorAgent(BaseAgent):
         self,
         *,
         language: str,
-        domain: str | None,
         agent_emotion: str | None,
         user_emotion: str | None,
-        extra_guidance: str | None,
+        agent_accent: str | None = None,
+        user_accent: str | None = None,
+        gender_pair: str | None = None,
     ) -> str:
         lines = [
             "Generate ONE new conversation topic.",
             f"Language of the conversations: {language}.",
         ]
-        if domain:
-            lines.append(f"Domain / setting: {domain}.")
         if agent_emotion:
             lines.append(f"Agent's emotional tone: {agent_emotion}.")
         if user_emotion:
             lines.append(f"User's emotional tone: {user_emotion}.")
-        if extra_guidance:
-            lines.append(extra_guidance)
+        if agent_accent:
+            lines.append(f"Agent's accent: {agent_accent}.")
+        if user_accent:
+            lines.append(f"User's accent: {user_accent}.")
+        if gender_pair:
+            lines.append(f"Agent/user gender pair in sequence where M means Male and F means Female: {gender_pair}.")
 
         if self.history:
             already = "\n".join(f"- {t['title']}" for t in self.history)

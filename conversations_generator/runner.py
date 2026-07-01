@@ -12,11 +12,13 @@ changing how callers wire things up.
 from __future__ import annotations
 
 import os
+import pandas as pd
 from pathlib import Path
 from typing import Any
 
 from .agents import TopicGeneratorAgent
 from .llm import BaseLLM
+from .models import CorpusInstance
 
 
 def load_env(filename: str = ".env") -> None:
@@ -62,13 +64,31 @@ class ConversationRunner:
     def run(self, **profile: Any) -> dict[str, str]:
         """Run the currently-wired pipeline for one item and return its output."""
         return self.generate_topic(**profile)
+    
+def read_corpus_instances(corpus_path: str) -> pd.DataFrame:
+    """Read the corpus instances from a JSONL file and return as a DataFrame."""
+    if not os.path.exists(corpus_path):
+        raise FileNotFoundError(f"Corpus file not found: {corpus_path}")
+    
+    df = pd.read_json(corpus_path, lines=True)
+    return df
 
 
 def main() -> None:
     load_env()  # pull GROQ_API_KEY / GEMINI_API_KEY from .env
     runner = ConversationRunner()
-    topic = runner.run(language="Hinglish", domain="banking support call")
-    print(f"{topic['title']}\n{topic['context']}")
+
+    corpus_path = Path(__file__).resolve().parent / "data" / "corpus_instances.jsonl"
+    corpus_df = read_corpus_instances(str(corpus_path))
+
+    # Pick one row and convert to a typed CorpusInstance.
+    row = corpus_df.iloc[0].to_dict()
+    instance = CorpusInstance.from_dict(row)
+
+    # .to_profile() returns only the kwargs the pipeline cares about.
+    topic = runner.run(**instance.to_profile())
+    print(f"[{instance.language} | {instance.gender_pair}] "
+          f"{topic['title']}\n{topic['context']}")
 
 
 if __name__ == "__main__":
