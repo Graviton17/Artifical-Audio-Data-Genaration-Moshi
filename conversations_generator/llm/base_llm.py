@@ -63,23 +63,20 @@ class BaseLLM(ABC):
     def generate(
         self,
         prompt: str,
-        *,
-        system: str | None = None,
         **overrides: Any,
     ) -> str:
-        """Single-turn helper: send one user prompt, return the text reply."""
-        messages: list[Message] = []
-        if system:
-            messages.append({"role": "system", "content": system})
-        messages.append({"role": "user", "content": prompt})
-        return self.chat(messages, **overrides).text
+        """Single-turn generation: prompt → text reply.
 
-    def chat(self, messages: list[Message], **overrides: Any) -> LLMResponse:
-        """Multi-turn completion with retry/backoff around the provider call."""
+        The caller is responsible for combining any system instructions and
+        dynamic content into ``prompt`` before calling this method.
+        Retries with exponential backoff on transient provider errors.
+        """
+        messages: list[Message] = [{"role": "system", "content": prompt}]
+
         last_err: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                return self._complete(messages, **overrides)
+                return self._complete(messages, **overrides).text
             except Exception as err:  # noqa: BLE001 - normalized into LLMError below
                 last_err = err
                 if attempt == self.max_retries:
@@ -92,15 +89,13 @@ class BaseLLM(ABC):
     def generate_json(
         self,
         prompt: str,
-        *,
-        system: str | None = None,
         **overrides: Any,
     ) -> Any:
         """Like :meth:`generate` but parse the reply as JSON.
 
         Tolerates responses wrapped in ```json ... ``` fences.
         """
-        text = self.generate(prompt, system=system, **overrides)
+        text = self.generate(prompt, **overrides)
         return self._parse_json(text)
 
     # ------------------------------------------------------------------ #

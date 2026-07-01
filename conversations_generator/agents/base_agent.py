@@ -27,10 +27,14 @@ class BaseAgent(ABC):
         raise NotImplementedError
 
     # ------------------------------------------------------------------ #
-    # Convenience wrappers that always apply this agent's system prompt
+    # Convenience wrappers that prepend this agent's system prompt
     # ------------------------------------------------------------------ #
+    def _build_full_prompt(self, prompt: str) -> str:
+        """Combine the static system prompt with the dynamic per-call prompt."""
+        return f"{self.system_prompt}\n\n{prompt}"
+
     def _generate(self, prompt: str, **overrides: Any) -> str:
-        return self.llm.generate(prompt, system=self.system_prompt, **overrides)
+        return self.llm.generate(self._build_full_prompt(prompt), **overrides)
 
     def _generate_json(self, prompt: str, **overrides: Any) -> Any:
-        return self.llm.generate_json(prompt, system=self.system_prompt, **overrides)
+        return self.llm.generate_json(self._build_full_prompt(prompt), **overrides)
