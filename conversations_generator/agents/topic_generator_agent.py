@@ -34,6 +34,9 @@ class TopicGeneratorAgent(BaseAgent):
             language=language,
             agent_emotion=agent_emotion,
             user_emotion=user_emotion,
+            agent_accent=agent_accent,
+            user_accent=user_accent,
+            gender_pair=gender_pair,
         )
 
         overrides.setdefault("response_format", {"type": "json_object"})
