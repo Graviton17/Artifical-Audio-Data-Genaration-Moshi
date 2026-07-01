@@ -27,12 +27,14 @@ class BaseAgent(ABC):
         raise NotImplementedError
 
     # ------------------------------------------------------------------ #
-    # Convenience wrappers that always apply this agent's system prompt
+    # Convenience wrappers that prepend this agent's system prompt
     # ------------------------------------------------------------------ #
     def _generate(self, prompt: str, system_vars: dict[str, Any] | None = None, **overrides: Any) -> str:
         system = self.langfuse_prompt.compile(**(system_vars or {}))
-        return self.llm.generate(prompt, system=system, **overrides)
+        full_prompt = f"{system}\n\n{prompt}"
+        return self.llm.generate(full_prompt, **overrides)
 
     def _generate_json(self, prompt: str, system_vars: dict[str, Any] | None = None, **overrides: Any) -> Any:
         system = self.langfuse_prompt.compile(**(system_vars or {}))
-        return self.llm.generate_json(prompt, system=system, **overrides)
+        full_prompt = f"{system}\n\n{prompt}"
+        return self.llm.generate_json(full_prompt, **overrides)
