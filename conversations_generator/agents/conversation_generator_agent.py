@@ -141,6 +141,8 @@ class ConversationGeneratorAgent(BaseAgent):
             lines.append(
                 f"**Gender pair (speaker_1-speaker_2, M=Male, F=Female):** {gender_pair}"
             )
+        
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ #
     # Output normalization
