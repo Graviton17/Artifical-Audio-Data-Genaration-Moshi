@@ -16,7 +16,7 @@ import pandas as pd
 from pathlib import Path
 from typing import Any
 
-from .agents import TopicGeneratorAgent
+from .agents import ConversationGeneratorAgent, TopicGeneratorAgent
 from .llm import BaseLLM
 from .models import CorpusInstance
 
@@ -48,8 +48,7 @@ class ConversationRunner:
         # Shared LLM: None lets each agent fall back to its own default (Groq).
         self.llm = llm
         self.topic_agent = TopicGeneratorAgent(llm)
-        # Future stages (conversation generator, validators) are added here as
-        # they are implemented and exposed via their own run_* method below.
+        self.conversation_agent = ConversationGeneratorAgent(llm)
 
     # ------------------------------------------------------------------ #
     # Stage 1: topic
@@ -59,11 +58,40 @@ class ConversationRunner:
         return self.topic_agent.run(**profile)
 
     # ------------------------------------------------------------------ #
+    # Stage 2: conversation
+    # ------------------------------------------------------------------ #
+    def generate_conversation(
+        self,
+        topic: dict[str, str],
+        **profile: Any,
+    ) -> list[dict[str, Any]]:
+        """Generate a full conversation from a topic dict.
+
+        Parameters
+        ----------
+        topic : dict
+            Must contain ``title`` and ``context`` (output of stage 1).
+        **profile
+            Language, emotion, accent, gender_pair, etc.
+        """
+        return self.conversation_agent.run(
+            title=topic["title"],
+            context=topic.get("context", ""),
+            conversation_type=topic.get("conversation_type"),
+            **profile,
+        )
+
+    # ------------------------------------------------------------------ #
     # Entry point
     # ------------------------------------------------------------------ #
-    def run(self, **profile: Any) -> dict[str, str]:
-        """Run the currently-wired pipeline for one item and return its output."""
-        return self.generate_topic(**profile)
+    def run(self, **profile: Any) -> dict[str, Any]:
+        """Run the full pipeline: topic → conversation.
+
+        Returns a dict with ``topic`` and ``turns`` keys.
+        """
+        topic = self.generate_topic(**profile)
+        turns = self.generate_conversation(topic, **profile)
+        return {"topic": topic, "turns": turns}
     
 def read_corpus_instances(corpus_path: str) -> pd.DataFrame:
     """Read the corpus instances from a JSONL file and return as a DataFrame."""
@@ -85,11 +113,10 @@ def main() -> None:
     row = corpus_df.iloc[148].to_dict()
     instance = CorpusInstance.from_dict(row)
 
-    # .to_profile() returns only the kwargs the pipeline cares about.
-    for i in range(1, 31):
-        topic = runner.run(**instance.to_profile())
-        print(f"[Run {i}/30 | {instance.language} | {instance.gender_pair} | {topic.get('conversation_type', 'unknown')}] "
-              f"{topic['title']}\n{topic['context']}\n")
+    result = runner.run(**instance.to_profile())
+    topic, turns = result["topic"], result["turns"]
+    print(f"[Language: {instance.language} | Gender: {instance.gender_pair} | Type: {topic.get('conversation_type', 'unknown')}] {topic['title']}")
+    print(turns)
 
 
 if __name__ == "__main__":
