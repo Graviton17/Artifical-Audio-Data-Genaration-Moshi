@@ -12,6 +12,7 @@ to the caller.
 
 from __future__ import annotations
 
+import json
 import os
 import random
 import pandas as pd
@@ -339,51 +340,106 @@ def read_corpus_instances(corpus_path: str) -> pd.DataFrame:
     return df
 
 
+# Safety cap: give up on an instance after this many *consecutive* generations
+# that fail validation, so a persistently-failing profile can't loop forever.
+MAX_CONSECUTIVE_FAILURES = 10
+
+
+def process_instance(runner: ConversationRunner, instance: CorpusInstance) -> float:
+    """Generate conversations for one instance until its target duration is met.
+
+    Repeatedly runs the pipeline for the *same* instance, accumulating the
+    (validated) duration of each accepted conversation, and stops once the total
+    reaches ``instance.duration_sec``. Only conversations that pass validation
+    count toward the target. Returns the total seconds generated.
+
+    NOTE: persistence is intentionally left out here — each accepted ``result``
+    is where a HuggingFace upload / checkpoint hook will go later.
+    """
+    target_sec = instance.duration_sec or 0.0
+
+    Logger.step(
+        f"Instance {instance.corpus_combination_id} "
+        f"[{instance.language} | {instance.gender_pair}] — "
+        f"target {target_sec:.0f}s ({target_sec / 3600:.2f} hr)"
+    )
+
+    total_generated_sec = 0.0
+    index = 0
+    consecutive_failures = 0
+
+    while total_generated_sec < target_sec:
+        index += 1
+        Logger.divider()
+        Logger.info(
+            f"Instance {instance.corpus_combination_id} — conversation {index} "
+            f"(progress {total_generated_sec:.0f}/{target_sec:.0f}s, "
+            f"{total_generated_sec / target_sec * 100 if target_sec else 0:.1f}%)"
+        )
+
+        result = runner.run(**instance.to_profile())
+        manual_report = result.get("manual_validation")
+        duration = getattr(manual_report, "duration_sec", None)
+
+        if not result.get("passed") or not duration:
+            consecutive_failures += 1
+            Logger.error(
+                f"Conversation {index} failed validation "
+                f"(consecutive failures: {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})."
+            )
+            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+                Logger.error(
+                    f"Aborting instance {instance.corpus_combination_id}: "
+                    f"{MAX_CONSECUTIVE_FAILURES} consecutive failures."
+                )
+                break
+            continue
+
+        consecutive_failures = 0
+        # TODO: upload `result` to the HuggingFace bucket + write a checkpoint here.
+        total_generated_sec += duration
+        Logger.success(
+            f"Conversation {index} accepted (+{duration:.0f}s) — "
+            f"total {total_generated_sec:.0f}/{target_sec:.0f}s",
+            bold=True,
+        )
+
+    Logger.success(
+        f"Instance {instance.corpus_combination_id} complete: "
+        f"{total_generated_sec:.0f}s across {index} conversation(s).",
+        bold=True,
+    )
+    return total_generated_sec
+
+
 def main() -> None:
     load_env()  # pull GROQ_API_KEY / GEMINI_API_KEY from .env
-    
+
+    # ``ENV=production`` processes every corpus instance in sequence; anything
+    # else (the default) is treated as development and runs only the first row.
+    env = os.getenv("ENV", "development").strip().lower()
+    is_production = env == "production"
+
     gemini_llm = GeminiLLM()
     runner = ConversationRunner(llm=gemini_llm, max_agent_attempts=3, max_manual_attempts=3)
 
     corpus_path = Path(__file__).resolve().parent / "data" / "corpus_instances.jsonl"
     corpus_df = read_corpus_instances(str(corpus_path))
 
-    # Pick one row and convert to a typed CorpusInstance.
-    row = corpus_df.iloc[135].to_dict()
-    instance = CorpusInstance.from_dict(row)
+    if is_production:
+        Logger.step(f"PRODUCTION run — processing all {len(corpus_df)} instances in sequence.")
+        indices = range(len(corpus_df))
+    else:
+        Logger.step("DEVELOPMENT run — processing only instance iloc[0].")
+        indices = range(1)
 
-    num_outputs = 2  # Loop to get multiple outputs for that 1 instance
-    for i in range(num_outputs):
-        Logger.divider()
-        Logger.info(f"--- Iteration {i+1}/{num_outputs} for Instance ---")
-        result = runner.run(**instance.to_profile())
-        topic, turns = result["topic"], result["turns"]
-        manual_report = result["manual_validation"]
-        agent_report = result["agent_validation"]
+    for i in indices:
+        row: dict[str, Any] = {str(k): v for k, v in corpus_df.iloc[i].to_dict().items()}
+        instance = CorpusInstance.from_dict(row)
+        process_instance(runner, instance)
 
-        Logger.divider()
-        print(
-            f"[Language: {instance.language} | Gender: {instance.gender_pair} | "
-            f"Type: {topic.get('conversation_type', 'unknown')}] {topic['title']}"
-        )
-        print(f"Context: {topic.get('context', '')}")
-        print(turns)
-        
-        Logger.divider()
-        print("--- Manual validation ---")
-        if manual_report:
-            manual_report.print()
-            
-        Logger.divider()
-        print("--- Agent validation ---")
-        if agent_report:
-            agent_report.print()
-
-        if not result["passed"]:
-            Logger.error(f"Conversation failed validation after all retry attempts on iteration {i+1}.")
-        else:
-            Logger.success(f"Pipeline completed successfully for iteration {i+1}!", bold=True)
-        Logger.divider()
+    Logger.divider()
+    Logger.success("All requested instances processed.", bold=True)
 
 
 if __name__ == "__main__":
