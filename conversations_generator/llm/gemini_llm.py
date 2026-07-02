@@ -29,9 +29,11 @@ class GeminiLLM(BaseLLM):
         *,
         api_key: str | None = None,
         temperature: float = 0.7,
-        max_tokens: int | None = None,
+        max_tokens: int | None = 65536,
+        thinking_budget: int | None = 8192,
         max_retries: int = 3,
         retry_backoff: float = 2.0,
+        timeout: float = 600.0,
     ) -> None:
         if genai is None:
             raise ImportError(
@@ -44,6 +46,8 @@ class GeminiLLM(BaseLLM):
             max_retries=max_retries,
             retry_backoff=retry_backoff,
         )
+        self.thinking_budget = thinking_budget
+        self.timeout = timeout
         key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
         if not key:
             raise LLMError(
@@ -59,12 +63,20 @@ class GeminiLLM(BaseLLM):
         if not mime_type and overrides.get("response_format", {}).get("type") == "json_object":
             mime_type = "application/json"
 
+        # Cap Gemini's internal "thinking" phase so it doesn't spin forever.
+        thinking_config = None
+        if self.thinking_budget is not None:
+            thinking_config = genai_types.ThinkingConfig(
+                thinking_budget=self.thinking_budget,
+            )
+
         config = genai_types.GenerateContentConfig(
             temperature=params["temperature"],
             max_output_tokens=params["max_tokens"],
             system_instruction=system_instruction or None,
             # Ask Gemini to emit raw JSON when the caller wants it (generate_json).
             response_mime_type=mime_type,
+            thinking_config=thinking_config,
         )
 
         response = self._client.models.generate_content(

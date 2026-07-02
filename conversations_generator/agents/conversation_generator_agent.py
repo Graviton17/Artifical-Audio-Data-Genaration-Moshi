@@ -151,8 +151,6 @@ class ConversationGeneratorAgent(BaseAgent):
             lines.append(
                 f"**Gender pair (speaker_1-speaker_2, M=Male, F=Female):** {gender_pair}"
             )
-        
-        return "\n".join(lines)
 
         if previous_turns and feedback:
             lines.append("")
@@ -168,6 +166,8 @@ class ConversationGeneratorAgent(BaseAgent):
             clean_prev = [{k: v for k, v in t.items() if k not in {"real_start_sec", "real_end_sec", "error_time"}} for t in previous_turns]
             lines.append(json.dumps(clean_prev, indent=2, ensure_ascii=False))
             lines.append("```")
+
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------ #
     # Output normalization
