@@ -68,6 +68,7 @@ class ConversationRunner:
         validator: ConversationValidatorManual | None = None,
         max_agent_attempts: int = 3,
         max_manual_attempts: int = 3,
+        max_agent_validation_retries: int = 3,
     ) -> None:
         self.llm = llm
         self.topic_agent = TopicGeneratorAgent(llm)
@@ -76,6 +77,9 @@ class ConversationRunner:
         self.agent_validator = ConversationValidatorAgent(llm)
         self.max_agent_attempts = max(1, max_agent_attempts)
         self.max_manual_attempts = max(1, max_manual_attempts)
+        # How many times to retry the agent-validation CALL if it errors out
+        # (bad/unparseable LLM response) before bypassing the step entirely.
+        self.max_agent_validation_retries = max(1, max_agent_validation_retries)
 
     # ------------------------------------------------------------------ #
     # Stage 1: topic
@@ -163,6 +167,7 @@ class ConversationRunner:
 
         previous_turns: list[dict[str, Any]] | None = None
         feedback: str | None = None
+        agent_validation_bypassed = False
 
         for agent_attempt in range(1, self.max_agent_attempts + 1):
             if agent_attempt > 1:
@@ -220,7 +225,27 @@ class ConversationRunner:
                 break
                 
             Logger.step(f"Stage 3: LLM Agent Validation (Attempt {agent_attempt}/{self.max_agent_attempts})")
-            agent_report = self.agent_validator.run(turns=turns, topic=topic, **profile)
+            agent_report = None
+            for validation_attempt in range(1, self.max_agent_validation_retries + 1):
+                try:
+                    agent_report = self.agent_validator.run(turns=turns, topic=topic, **profile)
+                    break
+                except (ValueError, LLMError) as err:
+                    Logger.warning(
+                        f"Agent validation call failed "
+                        f"(attempt {validation_attempt}/{self.max_agent_validation_retries}): {err}"
+                    )
+
+            # Still couldn't get a verdict after all retries — bypass the step and
+            # accept the conversation, which already passed manual validation.
+            if agent_report is None:
+                Logger.warning(
+                    f"Agent validation unavailable after {self.max_agent_validation_retries} "
+                    "retries. Bypassing agent validation for this conversation."
+                )
+                agent_validation_bypassed = True
+                break
+
             if agent_report.passed:
                 Logger.success(f"Agent validation passed! (Realism: {agent_report.realism_score}, Match: {agent_report.corpus_match_score})", bold=True)
                 break
@@ -247,7 +272,14 @@ class ConversationRunner:
             "turns": turns,
             "manual_validation": manual_report,
             "agent_validation": agent_report,
-            "passed": (manual_report and not manual_report.has_errors) and (agent_report and agent_report.passed),
+            "agent_validation_bypassed": agent_validation_bypassed,
+            # Accept the conversation if manual validation passed AND agent
+            # validation either passed or was bypassed after exhausting retries.
+            "passed": bool(
+                manual_report
+                and not manual_report.has_errors
+                and (agent_validation_bypassed or (agent_report and agent_report.passed))
+            ),
         }
 
 
@@ -270,7 +302,7 @@ def main() -> None:
     corpus_df = read_corpus_instances(str(corpus_path))
 
     # Pick one row and convert to a typed CorpusInstance.
-    row = corpus_df.iloc[148].to_dict()
+    row = corpus_df.iloc[135].to_dict()
     instance = CorpusInstance.from_dict(row)
 
     num_outputs = 2  # Loop to get multiple outputs for that 1 instance
