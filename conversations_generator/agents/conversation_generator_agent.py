@@ -54,6 +54,7 @@ class ConversationGeneratorAgent(BaseAgent):
         gender_pair: str | None = None,
         previous_turns: list[dict[str, Any]] | None = None,
         feedback: str | None = None,
+        target_duration_sec: float | None = None,
         **overrides: Any,
     ) -> list[dict[str, Any]]:
         """Generate a full conversation for the given topic.
@@ -99,6 +100,7 @@ class ConversationGeneratorAgent(BaseAgent):
             gender_pair=gender_pair,
             previous_turns=previous_turns,
             feedback=feedback,
+            target_duration_sec=target_duration_sec,
         )
 
         system_vars: dict[str, Any] = {}
@@ -126,6 +128,7 @@ class ConversationGeneratorAgent(BaseAgent):
         gender_pair: str | None,
         previous_turns: list[dict[str, Any]] | None,
         feedback: str | None,
+        target_duration_sec: float | None = None,
     ) -> str:
         """Assemble the user-side prompt sent alongside the Langfuse system prompt."""
         lines: list[str] = [
@@ -150,6 +153,16 @@ class ConversationGeneratorAgent(BaseAgent):
         if gender_pair:
             lines.append(
                 f"**Gender pair (speaker_1-speaker_2, M=Male, F=Female):** {gender_pair}"
+            )
+
+        if target_duration_sec is not None:
+            lines.append("")
+            lines.append("## Target duration")
+            lines.append(
+                f"The conversation MUST last approximately **{target_duration_sec:.0f} seconds** "
+                f"(~{target_duration_sec / 60:.1f} minutes) end to end. Pace the number of turns "
+                f"and their planned timing so the final turn's end time lands as close as possible "
+                f"to {target_duration_sec:.0f}s."
             )
 
         if previous_turns and feedback:

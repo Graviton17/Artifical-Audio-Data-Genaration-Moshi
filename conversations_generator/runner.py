@@ -13,6 +13,7 @@ to the caller.
 from __future__ import annotations
 
 import os
+import random
 import pandas as pd
 from pathlib import Path
 from typing import Any
@@ -43,6 +44,37 @@ def load_env(filename: str = ".env") -> None:
                 key, value = key.strip(), value.strip().strip('"').strip("'")
                 os.environ.setdefault(key, value)
             return
+
+
+# Target conversation duration is drawn from a Gaussian so lengths cluster
+# around the middle of the 5–15 min window instead of being uniform. The mean
+# sits at the window centre (10 min) and sigma is chosen so the 5–15 min range
+# spans ~±2σ (≈95% of the mass). Samples are truncated (resampled) back into the
+# window so the reported target is always a real 5–15 min value.
+DURATION_MIN_SEC = 5 * 60      # 300s — 5 min
+DURATION_MAX_SEC = 15 * 60     # 900s — 15 min
+DURATION_MEAN_SEC = (DURATION_MIN_SEC + DURATION_MAX_SEC) / 2   # 600s — 10 min
+DURATION_STD_SEC = (DURATION_MAX_SEC - DURATION_MIN_SEC) / 4    # 150s — ±2σ covers the range
+
+
+def sample_target_duration_sec(
+    mean: float = DURATION_MEAN_SEC,
+    std: float = DURATION_STD_SEC,
+    low: float = DURATION_MIN_SEC,
+    high: float = DURATION_MAX_SEC,
+) -> float:
+    """Draw a target conversation duration (seconds) from a truncated Gaussian.
+
+    Values are sampled from ``Normal(mean, std)`` and resampled until they land
+    inside ``[low, high]`` (a truncated normal), so lengths follow a bell curve
+    centred at ``mean`` rather than being uniform. Falls back to a hard clamp
+    after a bounded number of tries to guarantee termination.
+    """
+    for _ in range(100):
+        value = random.gauss(mean, std)
+        if low <= value <= high:
+            return round(value, 1)
+    return round(min(max(random.gauss(mean, std), low), high), 1)
 
 
 class ConversationRunner:
@@ -99,6 +131,7 @@ class ConversationRunner:
         topic: dict[str, str],
         previous_turns: list[dict[str, Any]] | None = None,
         feedback: str | None = None,
+        target_duration_sec: float | None = None,
         **profile: Any,
     ) -> list[dict[str, Any]]:
         """Generate a full conversation from a topic dict.
@@ -111,6 +144,9 @@ class ConversationRunner:
             The previous turn to learn from, if validation failed.
         feedback : str | None
             Validation feedback string.
+        target_duration_sec : float | None
+            Exact target duration (seconds) the conversation should aim for,
+            drawn from the Gaussian in :func:`sample_target_duration_sec`.
         **profile
             Language, emotion, accent, gender_pair, etc.
         """
@@ -120,6 +156,7 @@ class ConversationRunner:
             conversation_type=topic.get("conversation_type"),
             previous_turns=previous_turns,
             feedback=feedback,
+            target_duration_sec=target_duration_sec,
             **profile,
         )
 
@@ -161,6 +198,15 @@ class ConversationRunner:
         Logger.step(f"Starting pipeline for language: {profile.get('language', 'unknown')}")
         topic = self.generate_topic(**profile)
 
+        # Draw one exact target duration for this conversation from the Gaussian
+        # so lengths follow the intended 5–10 min distribution. Sampled once and
+        # reused across all retries so every regeneration aims for the same target.
+        target_duration_sec = sample_target_duration_sec()
+        Logger.info(
+            f"Target conversation duration: {target_duration_sec:.1f}s "
+            f"({target_duration_sec / 60:.2f} min)"
+        )
+
         turns: list[dict[str, Any]] = []
         manual_report: ValidationReport | None = None
         agent_report: AgentValidationReport | None = None
@@ -186,6 +232,7 @@ class ConversationRunner:
                         topic,
                         previous_turns=previous_turns,
                         feedback=feedback,
+                        target_duration_sec=target_duration_sec,
                         **profile
                     )
                 except (ValueError, LLMError) as err:
