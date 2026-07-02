@@ -20,7 +20,7 @@ from typing import Any
 from .agents import ConversationGeneratorAgent, TopicGeneratorAgent
 from .agents.conversation_validator_agent import ConversationValidatorAgent, AgentValidationReport
 from .agents.conversation_validator_manual import ConversationValidatorManual, ValidationReport
-from .llm import BaseLLM, OpenAILLM
+from .llm import BaseLLM, OpenAILLM, LLMError
 from .logger import Logger
 from .models import CorpusInstance
 
@@ -176,13 +176,20 @@ class ConversationRunner:
                     Logger.retry(f"Manual Validation Retry: Attempt {manual_attempt}/{self.max_manual_attempts}")
                 
                 Logger.info("Generating conversation turns...")
-                turns = self.generate_conversation(
-                    topic, 
-                    previous_turns=previous_turns, 
-                    feedback=feedback, 
-                    **profile
-                )
-                
+                try:
+                    turns = self.generate_conversation(
+                        topic,
+                        previous_turns=previous_turns,
+                        feedback=feedback,
+                        **profile
+                    )
+                except (ValueError, LLMError) as err:
+                    Logger.warning(f"Conversation generation failed: {err}")
+                    manual_report = None
+                    feedback = f"Conversation generation error on the previous attempt: {err}"
+                    previous_turns = None
+                    continue
+
                 Logger.info("Running deterministic manual validation...")
                 manual_report = self.validate_conversation(turns)
                 if not manual_report.has_errors:
@@ -204,8 +211,10 @@ class ConversationRunner:
                     problematic_turn = turns[-1]
                 previous_turns = [problematic_turn] if problematic_turn else None
 
-            assert manual_report is not None
-            
+            if manual_report is None:
+                Logger.error("Conversation generation kept failing across all manual retries. Bailing out.")
+                break
+
             if manual_report.has_errors:
                 Logger.error("Failed manual validation after all retries. Bailing out.")
                 break
