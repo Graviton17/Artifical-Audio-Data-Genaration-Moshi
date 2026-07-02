@@ -224,6 +224,8 @@ class ConversationValidatorAgent(BaseAgent):
         overrides.setdefault("temperature", 0.2)
         overrides.setdefault("response_format", {"type": "json_object"})
         raw_result = self._generate_json(prompt, system_vars=system_vars, **overrides)
+        from ..logger import Logger
+        Logger.debug(f"Validator LLM Output:\n{json.dumps(raw_result, indent=2)}")
         return self._normalize(raw_result)
 
     # ------------------------------------------------------------------ #

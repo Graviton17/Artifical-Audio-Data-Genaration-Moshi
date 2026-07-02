@@ -257,13 +257,8 @@ class ConversationRunner:
                     f"- [Turn {e.turn_id}]: {e.message}" for e in manual_report.errors
                 )
                 
-                # Pass only ONE previous turn as requested by the user
-                problematic_turn = None
-                if manual_report.errors and manual_report.errors[0].turn_id:
-                    problematic_turn = next((t for t in turns if t.get("turn_id") == manual_report.errors[0].turn_id), turns[-1])
-                if not problematic_turn and turns:
-                    problematic_turn = turns[-1]
-                previous_turns = [problematic_turn] if problematic_turn else None
+                # Pass all previous turns so the generator has full context
+                previous_turns = turns if turns else None
 
             if manual_report is None:
                 Logger.error("Conversation generation kept failing across all manual retries. Bailing out.")
@@ -308,13 +303,8 @@ class ConversationRunner:
             if agent_report.issues:
                 feedback += "\n".join(f"- ({i.severity}) [Turn {i.turn_id}]: {i.description}" for i in agent_report.issues)
             
-            # Pass only ONE previous turn as requested by the user
-            problematic_turn = None
-            if agent_report.issues and agent_report.issues[0].turn_id:
-                problematic_turn = next((t for t in turns if t.get("turn_id") == agent_report.issues[0].turn_id), turns[-1])
-            if not problematic_turn and turns:
-                problematic_turn = turns[-1]
-            previous_turns = [problematic_turn] if problematic_turn else None
+            # Pass all previous turns so the generator has full context
+            previous_turns = turns if turns else None
 
         return {
             "topic": topic,

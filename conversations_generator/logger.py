@@ -68,6 +68,11 @@ class Logger:
         cls._log("retry", message)
         
     @classmethod
+    def debug(cls, message: str) -> None:
+        """Debug messages."""
+        cls._log("info", f"[DEBUG] {message}")
+        
+    @classmethod
     def divider(cls) -> None:
         """Visual divider."""
         print(f"{DIM}{'━' * 70}{RESET}")
