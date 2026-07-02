@@ -355,6 +355,7 @@ def process_instance(
     instance: CorpusInstance,
     storage: BaseStorage | None = None,
     checkpoint: Checkpoint | None = None,
+    max_conversations: int | None = None,
 ) -> float:
     """Generate conversations for one instance until its target duration is met.
 
@@ -371,6 +372,10 @@ def process_instance(
       each accepted conversation is uploaded to its instance folder in the
       bucket, and the root ``checkpoint.json`` is updated afterwards, so a crash
       loses at most the one conversation in flight.
+
+    ``max_conversations`` caps how many conversations are accepted this run,
+    regardless of the duration target — used in development to stop after a
+    single conversation instead of chasing the full multi-hour target.
     """
     target_sec = instance.duration_sec or 0.0
 
@@ -396,8 +401,11 @@ def process_instance(
     # a conversation a previous machine uploaded.
     index = progress.conversation_count
     consecutive_failures = 0
+    accepted = 0  # conversations accepted this run (for the max_conversations cap)
 
     while progress.generated_sec < target_sec:
+        if max_conversations is not None and accepted >= max_conversations:
+            break
         index += 1
         Logger.divider()
         Logger.info(
@@ -425,6 +433,7 @@ def process_instance(
             continue
 
         consecutive_failures = 0
+        accepted += 1
 
         if storage is not None and checkpoint is not None:
             # Upload the conversation, THEN advance + persist the checkpoint. The
@@ -482,6 +491,9 @@ def main() -> None:
     # Storage + checkpoint are production-only. Dev runs entirely in memory.
     storage: BaseStorage | None = None
     checkpoint: Checkpoint | None = None
+    # In development, cap at a single conversation for iloc[0]; production chases
+    # each instance's full duration target.
+    max_conversations: int | None = None
     if is_production:
         Logger.step(f"PRODUCTION run — processing all {len(corpus_df)} instances in sequence.")
         storage = HuggingFaceStorage()
@@ -489,13 +501,14 @@ def main() -> None:
         Logger.info(f"Loaded checkpoint with {len(checkpoint.instances)} instance record(s).")
         indices = range(len(corpus_df))
     else:
-        Logger.step("DEVELOPMENT run — processing only instance iloc[0] (no upload).")
+        Logger.step("DEVELOPMENT run — generating a single conversation for instance iloc[0] (no upload).")
         indices = range(1)
+        max_conversations = 1
 
     for i in indices:
         row: dict[str, Any] = {str(k): v for k, v in corpus_df.iloc[i].to_dict().items()}
         instance = CorpusInstance.from_dict(row)
-        process_instance(runner, instance, storage, checkpoint)
+        process_instance(runner, instance, storage, checkpoint, max_conversations)
 
     Logger.divider()
     Logger.success("All requested instances processed.", bold=True)

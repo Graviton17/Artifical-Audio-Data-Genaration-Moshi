@@ -147,14 +147,25 @@ class HuggingFaceStorage(BaseStorage):
             )
         except Exception as err:  # noqa: BLE001
             if any(hint in str(err).lower() for hint in _NOT_FOUND_HINTS):
-                return Checkpoint()  # first run — no checkpoint yet
+                return self._init_checkpoint()  # first run — no checkpoint yet
             raise StorageError(f"Failed to read checkpoint: {err}") from err
 
         if not local.exists():
             # Some backends silently skip a missing file instead of raising.
-            return Checkpoint()
+            return self._init_checkpoint()
         with open(local, "r", encoding="utf-8") as f:
             return Checkpoint.from_dict(json.load(f))
+
+    def _init_checkpoint(self) -> Checkpoint:
+        """First-run bootstrap: create an empty checkpoint and upload it.
+
+        Writing it back immediately means the bucket always has a
+        ``checkpoint.json`` after the first run, so subsequent machines take the
+        normal resume path instead of re-detecting a missing file.
+        """
+        checkpoint = Checkpoint()
+        self.save_checkpoint(checkpoint)
+        return checkpoint
 
     def save_checkpoint(self, checkpoint: Checkpoint) -> None:
         self._upload_json(self.CHECKPOINT_NAME, checkpoint.to_dict())
