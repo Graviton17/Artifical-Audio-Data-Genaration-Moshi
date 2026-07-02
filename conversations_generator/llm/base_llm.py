@@ -93,10 +93,22 @@ class BaseLLM(ABC):
     ) -> Any:
         """Like :meth:`generate` but parse the reply as JSON.
 
-        Tolerates responses wrapped in ```json ... ``` fences.
+        Tolerates responses wrapped in ```json ... ``` fences. Malformed JSON
+        (the model occasionally emits a garbled/truncated object) is retried
+        with the same backoff as transport-level failures, since it's just as
+        transient — a fresh call to the same model+prompt usually parses fine.
         """
-        text = self.generate(prompt, **overrides)
-        return self._parse_json(text)
+        last_err: Exception | None = None
+        for attempt in range(1, self.max_retries + 1):
+            text = self.generate(prompt, **overrides)
+            try:
+                return self._parse_json(text)
+            except LLMError as err:
+                last_err = err
+                if attempt == self.max_retries:
+                    break
+                time.sleep(self.retry_backoff ** (attempt - 1))
+        raise last_err  # type: ignore[misc]
 
     # ------------------------------------------------------------------ #
     # Subclass contract
