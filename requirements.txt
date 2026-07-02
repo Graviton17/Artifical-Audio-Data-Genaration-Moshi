@@ -21,3 +21,6 @@ requests>=2.31        # KrutrimLLM (plain REST, no vendor SDK)
 
 # LANGFUSE
 langfuse>=2.0
+
+# Storage (production conversation bucket + checkpoint on HuggingFace Hub)
+huggingface_hub>=1.5.0   # bucket API: create_bucket / batch_bucket_files / download_bucket_files

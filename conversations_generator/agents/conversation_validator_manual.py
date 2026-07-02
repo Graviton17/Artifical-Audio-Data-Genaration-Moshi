@@ -51,8 +51,8 @@ REQUIRED_FIELDS = {
 }
 
 DEFAULT_TOLERANCE = 0.05           # seconds of slack allowed at boundaries
-DEFAULT_MIN_DURATION_SEC = 300     # 5 min
-DEFAULT_MAX_DURATION_SEC = 900     # 15 min
+DEFAULT_MIN_DURATION_SEC = 240     # 4 min
+DEFAULT_MAX_DURATION_SEC = 480     # 8 min
 DEFAULT_MIN_OVERLAP_COUNT = 2      # per non-Normal turn_type
 
 

@@ -25,6 +25,7 @@ from .agents.conversation_validator_manual import ConversationValidatorManual, V
 from .llm import BaseLLM, GeminiLLM, LLMError
 from .logger import Logger
 from .models import CorpusInstance
+from .storage import BaseStorage, Checkpoint, HuggingFaceStorage, InstanceProgress, StorageError
 
 
 def load_env(filename: str = ".env") -> None:
@@ -48,14 +49,14 @@ def load_env(filename: str = ".env") -> None:
 
 
 # Target conversation duration is drawn from a Gaussian so lengths cluster
-# around the middle of the 5–15 min window instead of being uniform. The mean
-# sits at the window centre (10 min) and sigma is chosen so the 5–15 min range
+# around the middle of the 4–8 min window instead of being uniform. The mean
+# sits at the window centre (6 min) and sigma is chosen so the 4–8 min range
 # spans ~±2σ (≈95% of the mass). Samples are truncated (resampled) back into the
-# window so the reported target is always a real 5–15 min value.
-DURATION_MIN_SEC = 5 * 60      # 300s — 5 min
-DURATION_MAX_SEC = 15 * 60     # 900s — 15 min
-DURATION_MEAN_SEC = (DURATION_MIN_SEC + DURATION_MAX_SEC) / 2   # 600s — 10 min
-DURATION_STD_SEC = (DURATION_MAX_SEC - DURATION_MIN_SEC) / 4    # 150s — ±2σ covers the range
+# window so the reported target is always a real 4–8 min value.
+DURATION_MIN_SEC = 4 * 60      # 240s — 4 min
+DURATION_MAX_SEC = 8 * 60      # 480s — 8 min
+DURATION_MEAN_SEC = (DURATION_MIN_SEC + DURATION_MAX_SEC) / 2   # 360s — 6 min
+DURATION_STD_SEC = (DURATION_MAX_SEC - DURATION_MIN_SEC) / 4    # 60s — ±2σ covers the range
 
 
 def sample_target_duration_sec(
@@ -345,7 +346,26 @@ def read_corpus_instances(corpus_path: str) -> pd.DataFrame:
 MAX_CONSECUTIVE_FAILURES = 10
 
 
-def process_instance(runner: ConversationRunner, instance: CorpusInstance) -> float:
+def _conversation_payload(instance: CorpusInstance, index: int, result: dict[str, Any]) -> dict[str, Any]:
+    """Build the JSON body stored for one accepted conversation."""
+    manual_report = result.get("manual_validation")
+    return {
+        "corpus_combination_id": instance.corpus_combination_id,
+        "index": index,
+        "profile": instance.to_profile(),
+        "topic": result.get("topic") or {},
+        "duration_sec": getattr(manual_report, "duration_sec", None),
+        "passed": result.get("passed", False),
+        "turns": result.get("turns", []),
+    }
+
+
+def process_instance(
+    runner: ConversationRunner,
+    instance: CorpusInstance,
+    storage: BaseStorage | None = None,
+    checkpoint: Checkpoint | None = None,
+) -> float:
     """Generate conversations for one instance until its target duration is met.
 
     Repeatedly runs the pipeline for the *same* instance, accumulating the
@@ -353,28 +373,47 @@ def process_instance(runner: ConversationRunner, instance: CorpusInstance) -> fl
     reaches ``instance.duration_sec``. Only conversations that pass validation
     count toward the target. Returns the total seconds generated.
 
-    NOTE: persistence is intentionally left out here — each accepted ``result``
-    is where a HuggingFace upload / checkpoint hook will go later.
+    Persistence is production-only and controlled by ``storage``:
+
+    * ``storage=None`` (development): nothing is uploaded — conversations are
+      generated and counted in memory only.
+    * ``storage`` provided (production): progress is resumed from ``checkpoint``,
+      each accepted conversation is uploaded to its instance folder in the
+      bucket, and the root ``checkpoint.json`` is updated afterwards, so a crash
+      loses at most the one conversation in flight.
     """
     target_sec = instance.duration_sec or 0.0
+
+    # In dev (no storage) progress lives only in this local record; in prod it's
+    # the shared, resumable checkpoint entry for this instance.
+    if storage is not None and checkpoint is not None:
+        progress = checkpoint.get(instance.corpus_combination_id, target_sec)
+    else:
+        progress = InstanceProgress(instance.corpus_combination_id, target_sec)
 
     Logger.step(
         f"Instance {instance.corpus_combination_id} "
         f"[{instance.language} | {instance.gender_pair}] — "
         f"target {target_sec:.0f}s ({target_sec / 3600:.2f} hr)"
     )
+    if progress.conversation_count:
+        Logger.info(
+            f"Resuming from checkpoint: {progress.generated_sec:.0f}s already done "
+            f"across {progress.conversation_count} conversation(s)."
+        )
 
-    total_generated_sec = 0.0
-    index = 0
+    # Continue numbering after whatever's already recorded so we never overwrite
+    # a conversation a previous machine uploaded.
+    index = progress.conversation_count
     consecutive_failures = 0
 
-    while total_generated_sec < target_sec:
+    while progress.generated_sec < target_sec:
         index += 1
         Logger.divider()
         Logger.info(
             f"Instance {instance.corpus_combination_id} — conversation {index} "
-            f"(progress {total_generated_sec:.0f}/{target_sec:.0f}s, "
-            f"{total_generated_sec / target_sec * 100 if target_sec else 0:.1f}%)"
+            f"(progress {progress.generated_sec:.0f}/{target_sec:.0f}s, "
+            f"{progress.generated_sec / target_sec * 100 if target_sec else 0:.1f}%)"
         )
 
         result = runner.run(**instance.to_profile())
@@ -396,20 +435,44 @@ def process_instance(runner: ConversationRunner, instance: CorpusInstance) -> fl
             continue
 
         consecutive_failures = 0
-        # TODO: upload `result` to the HuggingFace bucket + write a checkpoint here.
-        total_generated_sec += duration
-        Logger.success(
-            f"Conversation {index} accepted (+{duration:.0f}s) — "
-            f"total {total_generated_sec:.0f}/{target_sec:.0f}s",
-            bold=True,
-        )
+
+        if storage is not None and checkpoint is not None:
+            # Upload the conversation, THEN advance + persist the checkpoint. The
+            # conversation lands in the bucket before the checkpoint claims it,
+            # so a crash between the two just regenerates it — the checkpoint
+            # never points at a missing file.
+            try:
+                path = storage.save_conversation(
+                    instance.corpus_combination_id,
+                    index,
+                    _conversation_payload(instance, index, result),
+                )
+                checkpoint.record(progress, duration)
+                storage.save_checkpoint(checkpoint)
+            except StorageError as err:
+                Logger.error(f"Storage failure on conversation {index}, aborting instance: {err}")
+                break
+            Logger.success(
+                f"Saved {path} (+{duration:.0f}s) — "
+                f"total {progress.generated_sec:.0f}/{target_sec:.0f}s",
+                bold=True,
+            )
+        else:
+            # Development: count locally, don't upload.
+            progress.generated_sec += duration
+            progress.conversation_count += 1
+            Logger.success(
+                f"Conversation {index} accepted (+{duration:.0f}s, not uploaded in dev) — "
+                f"total {progress.generated_sec:.0f}/{target_sec:.0f}s",
+                bold=True,
+            )
 
     Logger.success(
         f"Instance {instance.corpus_combination_id} complete: "
-        f"{total_generated_sec:.0f}s across {index} conversation(s).",
+        f"{progress.generated_sec:.0f}s across {progress.conversation_count} conversation(s).",
         bold=True,
     )
-    return total_generated_sec
+    return progress.generated_sec
 
 
 def main() -> None:
@@ -426,17 +489,23 @@ def main() -> None:
     corpus_path = Path(__file__).resolve().parent / "data" / "corpus_instances.jsonl"
     corpus_df = read_corpus_instances(str(corpus_path))
 
+    # Storage + checkpoint are production-only. Dev runs entirely in memory.
+    storage: BaseStorage | None = None
+    checkpoint: Checkpoint | None = None
     if is_production:
         Logger.step(f"PRODUCTION run — processing all {len(corpus_df)} instances in sequence.")
+        storage = HuggingFaceStorage()
+        checkpoint = storage.load_checkpoint()
+        Logger.info(f"Loaded checkpoint with {len(checkpoint.instances)} instance record(s).")
         indices = range(len(corpus_df))
     else:
-        Logger.step("DEVELOPMENT run — processing only instance iloc[0].")
+        Logger.step("DEVELOPMENT run — processing only instance iloc[0] (no upload).")
         indices = range(1)
 
     for i in indices:
         row: dict[str, Any] = {str(k): v for k, v in corpus_df.iloc[i].to_dict().items()}
         instance = CorpusInstance.from_dict(row)
-        process_instance(runner, instance)
+        process_instance(runner, instance, storage, checkpoint)
 
     Logger.divider()
     Logger.success("All requested instances processed.", bold=True)
