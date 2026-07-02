@@ -264,35 +264,38 @@ def main() -> None:
     row = corpus_df.iloc[148].to_dict()
     instance = CorpusInstance.from_dict(row)
 
-    Logger.divider()
-    result = runner.run(**instance.to_profile())
-    topic, turns = result["topic"], result["turns"]
-    manual_report = result["manual_validation"]
-    agent_report = result["agent_validation"]
+    num_outputs = 2  # Loop to get multiple outputs for that 1 instance
+    for i in range(num_outputs):
+        Logger.divider()
+        Logger.info(f"--- Iteration {i+1}/{num_outputs} for Instance ---")
+        result = runner.run(**instance.to_profile())
+        topic, turns = result["topic"], result["turns"]
+        manual_report = result["manual_validation"]
+        agent_report = result["agent_validation"]
 
-    Logger.divider()
-    print(
-        f"[Language: {instance.language} | Gender: {instance.gender_pair} | "
-        f"Type: {topic.get('conversation_type', 'unknown')}] {topic['title']}"
-    )
-    print(f"Context: {topic.get('context', '')}")
-    print(turns)
-    
-    Logger.divider()
-    print("--- Manual validation ---")
-    if manual_report:
-        manual_report.print()
+        Logger.divider()
+        print(
+            f"[Language: {instance.language} | Gender: {instance.gender_pair} | "
+            f"Type: {topic.get('conversation_type', 'unknown')}] {topic['title']}"
+        )
+        print(f"Context: {topic.get('context', '')}")
+        print(turns)
         
-    Logger.divider()
-    print("--- Agent validation ---")
-    if agent_report:
-        agent_report.print()
+        Logger.divider()
+        print("--- Manual validation ---")
+        if manual_report:
+            manual_report.print()
+            
+        Logger.divider()
+        print("--- Agent validation ---")
+        if agent_report:
+            agent_report.print()
 
-    if not result["passed"]:
-        Logger.error("Conversation failed validation after all retry attempts.")
-    else:
-        Logger.success("Pipeline completed successfully!", bold=True)
-    Logger.divider()
+        if not result["passed"]:
+            Logger.error(f"Conversation failed validation after all retry attempts on iteration {i+1}.")
+        else:
+            Logger.success(f"Pipeline completed successfully for iteration {i+1}!", bold=True)
+        Logger.divider()
 
 
 if __name__ == "__main__":
