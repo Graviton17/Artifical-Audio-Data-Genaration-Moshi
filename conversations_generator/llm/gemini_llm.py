@@ -28,7 +28,7 @@ class GeminiLLM(BaseLLM):
 
     def __init__(
         self,
-        model: str = "gemini-3.1-pro-preview",
+        model: str = "gemini-2.5-flash",
         *,
         api_key: str | None = None,
         temperature: float | None = None,
@@ -102,7 +102,7 @@ class GeminiLLM(BaseLLM):
 
         thinking_level = overrides.get("thinking_level", self.thinking_level)
         thinking_budget = overrides.get("thinking_budget", self.thinking_budget)
-        thinking_config = self._build_thinking_config(thinking_level, thinking_budget)
+        thinking_config = self._build_thinking_config(self.model, thinking_level, thinking_budget)
 
         config = genai_types.GenerateContentConfig(
             # Only pass temperature if explicitly set -- leave unset (API
@@ -135,9 +135,15 @@ class GeminiLLM(BaseLLM):
     # ------------------------------------------------------------------ #
     @staticmethod
     def _build_thinking_config(
+        model: str,
         thinking_level: ThinkingLevel | None,
         thinking_budget: int | None,
     ) -> Any:
+        # "thinking_level" is a Gemini 3.x-only parameter -- Flash models don't
+        # support it and error out if it's sent. Fall back to thinking_budget
+        # (if set) or no thinking_config at all for those models.
+        if thinking_level is not None and "flash" in model.lower():
+            thinking_level = None
         if thinking_level is not None:
             return genai_types.ThinkingConfig(thinking_level=thinking_level)
         if thinking_budget is not None:
