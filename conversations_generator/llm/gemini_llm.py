@@ -55,12 +55,16 @@ class GeminiLLM(BaseLLM):
         params = self._resolved(overrides)
         system_instruction, contents = self._split_messages(messages)
 
+        mime_type = overrides.get("response_mime_type")
+        if not mime_type and overrides.get("response_format", {}).get("type") == "json_object":
+            mime_type = "application/json"
+
         config = genai_types.GenerateContentConfig(
             temperature=params["temperature"],
             max_output_tokens=params["max_tokens"],
             system_instruction=system_instruction or None,
             # Ask Gemini to emit raw JSON when the caller wants it (generate_json).
-            response_mime_type=overrides.get("response_mime_type"),
+            response_mime_type=mime_type,
         )
 
         response = self._client.models.generate_content(

@@ -18,8 +18,10 @@ from pathlib import Path
 from typing import Any
 
 from .agents import ConversationGeneratorAgent, TopicGeneratorAgent
+from .agents.conversation_validator_agent import ConversationValidatorAgent, AgentValidationReport
 from .agents.conversation_validator_manual import ConversationValidatorManual, ValidationReport
-from .llm import BaseLLM
+from .llm import BaseLLM, GeminiLLM
+from .logger import Logger
 from .models import CorpusInstance
 
 
@@ -64,20 +66,26 @@ class ConversationRunner:
         self,
         llm: BaseLLM | None = None,
         validator: ConversationValidatorManual | None = None,
-        max_generation_attempts: int = 1,
+        max_agent_attempts: int = 3,
+        max_manual_attempts: int = 3,
     ) -> None:
         self.llm = llm
         self.topic_agent = TopicGeneratorAgent(llm)
         self.conversation_agent = ConversationGeneratorAgent(llm)
         self.validator = validator or ConversationValidatorManual()
-        self.max_generation_attempts = max(1, max_generation_attempts)
+        self.agent_validator = ConversationValidatorAgent(llm)
+        self.max_agent_attempts = max(1, max_agent_attempts)
+        self.max_manual_attempts = max(1, max_manual_attempts)
 
     # ------------------------------------------------------------------ #
     # Stage 1: topic
     # ------------------------------------------------------------------ #
     def generate_topic(self, **profile: Any) -> dict[str, str]:
         """Produce the next single topic (see ``TopicGeneratorAgent.run``)."""
-        return self.topic_agent.run(**profile)
+        Logger.info(f"Generating topic for {profile.get('language', 'unknown')}...")
+        topic = self.topic_agent.run(**profile)
+        Logger.success(f"Topic generated: {topic.get('title', 'Unknown Title')}")
+        return topic
 
     # ------------------------------------------------------------------ #
     # Stage 2: conversation
@@ -85,6 +93,8 @@ class ConversationRunner:
     def generate_conversation(
         self,
         topic: dict[str, str],
+        previous_turns: list[dict[str, Any]] | None = None,
+        feedback: str | None = None,
         **profile: Any,
     ) -> list[dict[str, Any]]:
         """Generate a full conversation from a topic dict.
@@ -93,6 +103,10 @@ class ConversationRunner:
         ----------
         topic : dict
             Must contain ``title`` and ``context`` (output of stage 1).
+        previous_turns : list[dict] | None
+            The previous turn to learn from, if validation failed.
+        feedback : str | None
+            Validation feedback string.
         **profile
             Language, emotion, accent, gender_pair, etc.
         """
@@ -100,6 +114,8 @@ class ConversationRunner:
             title=topic["title"],
             context=topic.get("context", ""),
             conversation_type=topic.get("conversation_type"),
+            previous_turns=previous_turns,
+            feedback=feedback,
             **profile,
         )
 
@@ -123,26 +139,30 @@ class ConversationRunner:
     # Entry point
     # ------------------------------------------------------------------ #
     def run(self, **profile: Any) -> dict[str, Any]:
-        """Run the full pipeline: topic → conversation → manual validation.
+        """Run the full pipeline: topic → conversation → manual validation → agent validation.
 
-        Regenerates the conversation (same topic) up to
-        ``max_generation_attempts`` times if validation reports errors, then
-        returns the best attempt regardless of outcome so the caller can
-        decide what to do (log, discard, escalate, etc.).
+        Regenerates the conversation up to `max_agent_attempts` times based on
+        agent validation. For each agent attempt, it retries up to `max_manual_attempts`
+        times based on manual validation.
 
         Returns
         -------
         dict with keys:
             topic : dict        — output of stage 1
             turns : list[dict]  — output of stage 2 (last attempt)
-            validation : ValidationReport — output of stage 3 (last attempt)
-            attempts : int      — how many generation attempts were made
-            passed : bool       — True if the final attempt had no errors
+            manual_validation : ValidationReport — output of manual validation
+            agent_validation : AgentValidationReport | None — output of agent validation
+            passed : bool       — True if final attempt passed all checks
         """
+        Logger.step(f"Starting pipeline for language: {profile.get('language', 'unknown')}")
         topic = self.generate_topic(**profile)
 
         turns: list[dict[str, Any]] = []
-        report: ValidationReport | None = None
+        manual_report: ValidationReport | None = None
+        agent_report: AgentValidationReport | None = None
+
+        previous_turns: list[dict[str, Any]] | None = None
+        feedback: str | None = None
 
         for agent_attempt in range(1, self.max_agent_attempts + 1):
             if agent_attempt > 1:
@@ -176,9 +196,13 @@ class ConversationRunner:
                     f"- [Turn {e.turn_id}]: {e.message}" for e in manual_report.errors
                 )
                 
-                # Pass the full conversation so the LLM can see the complete
-                # context and fix structural/timing issues across all turns.
-                previous_turns = turns if turns else None
+                # Pass only ONE previous turn as requested by the user
+                problematic_turn = None
+                if manual_report.errors and manual_report.errors[0].turn_id:
+                    problematic_turn = next((t for t in turns if t.get("turn_id") == manual_report.errors[0].turn_id), turns[-1])
+                if not problematic_turn and turns:
+                    problematic_turn = turns[-1]
+                previous_turns = [problematic_turn] if problematic_turn else None
 
             assert manual_report is not None
             
@@ -201,16 +225,20 @@ class ConversationRunner:
             if agent_report.issues:
                 feedback += "\n".join(f"- ({i.severity}) [Turn {i.turn_id}]: {i.description}" for i in agent_report.issues)
             
-            # Pass the full conversation so the LLM can see the complete
-            # context and fix issues across all turns.
-            previous_turns = turns if turns else None
+            # Pass only ONE previous turn as requested by the user
+            problematic_turn = None
+            if agent_report.issues and agent_report.issues[0].turn_id:
+                problematic_turn = next((t for t in turns if t.get("turn_id") == agent_report.issues[0].turn_id), turns[-1])
+            if not problematic_turn and turns:
+                problematic_turn = turns[-1]
+            previous_turns = [problematic_turn] if problematic_turn else None
 
         return {
             "topic": topic,
             "turns": turns,
-            "validation": report,
-            "attempts": attempt,
-            "passed": not report.has_errors,
+            "manual_validation": manual_report,
+            "agent_validation": agent_report,
+            "passed": (manual_report and not manual_report.has_errors) and (agent_report and agent_report.passed),
         }
 
 
@@ -225,7 +253,9 @@ def read_corpus_instances(corpus_path: str) -> pd.DataFrame:
 
 def main() -> None:
     load_env()  # pull GROQ_API_KEY / GEMINI_API_KEY from .env
-    runner = ConversationRunner(max_generation_attempts=3)
+    
+    gemini_llm = GeminiLLM()
+    runner = ConversationRunner(llm=gemini_llm, max_agent_attempts=3, max_manual_attempts=3)
 
     corpus_path = Path(__file__).resolve().parent / "data" / "corpus_instances.jsonl"
     corpus_df = read_corpus_instances(str(corpus_path))
@@ -234,21 +264,35 @@ def main() -> None:
     row = corpus_df.iloc[148].to_dict()
     instance = CorpusInstance.from_dict(row)
 
+    Logger.divider()
     result = runner.run(**instance.to_profile())
-    topic, turns, report = result["topic"], result["turns"], result["validation"]
+    topic, turns = result["topic"], result["turns"]
+    manual_report = result["manual_validation"]
+    agent_report = result["agent_validation"]
 
+    Logger.divider()
     print(
         f"[Language: {instance.language} | Gender: {instance.gender_pair} | "
         f"Type: {topic.get('conversation_type', 'unknown')}] {topic['title']}"
     )
     print(f"Context: {topic.get('context', '')}")
     print(turns)
-    print()
-    print(f"--- Manual validation (attempt {result['attempts']}/{runner.max_generation_attempts}) ---")
-    report.print()
+    
+    Logger.divider()
+    print("--- Manual validation ---")
+    if manual_report:
+        manual_report.print()
+        
+    Logger.divider()
+    print("--- Agent validation ---")
+    if agent_report:
+        agent_report.print()
 
     if not result["passed"]:
-        print("\n⚠️  Conversation still failed manual validation after all retry attempts.")
+        Logger.error("Conversation failed validation after all retry attempts.")
+    else:
+        Logger.success("Pipeline completed successfully!", bold=True)
+    Logger.divider()
 
 
 if __name__ == "__main__":

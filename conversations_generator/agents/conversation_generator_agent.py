@@ -52,6 +52,8 @@ class ConversationGeneratorAgent(BaseAgent):
         agent_accent: str | None = None,
         user_accent: str | None = None,
         gender_pair: str | None = None,
+        previous_turns: list[dict[str, Any]] | None = None,
+        feedback: str | None = None,
         **overrides: Any,
     ) -> list[dict[str, Any]]:
         """Generate a full conversation for the given topic.
@@ -72,6 +74,10 @@ class ConversationGeneratorAgent(BaseAgent):
             Accent style for each speaker.
         gender_pair : str | None
             Gender pair string like "M-F", "M-M", "F-F", "F-M".
+        previous_turns : list[dict] | None
+            Previous attempt's turns to fix (used in retries).
+        feedback : str | None
+            Validation feedback describing what was wrong with the previous attempt.
         **overrides
             Extra kwargs forwarded to the LLM (temperature, max_tokens, etc.).
 
@@ -91,6 +97,8 @@ class ConversationGeneratorAgent(BaseAgent):
             agent_accent=agent_accent,
             user_accent=user_accent,
             gender_pair=gender_pair,
+            previous_turns=previous_turns,
+            feedback=feedback,
         )
 
         system_vars: dict[str, Any] = {}
@@ -116,6 +124,8 @@ class ConversationGeneratorAgent(BaseAgent):
         agent_accent: str | None,
         user_accent: str | None,
         gender_pair: str | None,
+        previous_turns: list[dict[str, Any]] | None,
+        feedback: str | None,
     ) -> str:
         """Assemble the user-side prompt sent alongside the Langfuse system prompt."""
         lines: list[str] = [
@@ -143,6 +153,21 @@ class ConversationGeneratorAgent(BaseAgent):
             )
         
         return "\n".join(lines)
+
+        if previous_turns and feedback:
+            lines.append("")
+            lines.append("## PREVIOUS ATTEMPT & VALIDATION FEEDBACK")
+            lines.append("Your previous attempt had errors. Please read the feedback below and generate a NEW, CORRECTED version of the conversation that fixes these issues.")
+            lines.append("")
+            lines.append("### Feedback / Errors to fix:")
+            lines.append(feedback)
+            lines.append("")
+            lines.append("### Previous Conversation Turns:")
+            lines.append("```json")
+            # Strip out unneeded timing stuff for brevity in prompt context
+            clean_prev = [{k: v for k, v in t.items() if k not in {"real_start_sec", "real_end_sec", "error_time"}} for t in previous_turns]
+            lines.append(json.dumps(clean_prev, indent=2, ensure_ascii=False))
+            lines.append("```")
 
     # ------------------------------------------------------------------ #
     # Output normalization
