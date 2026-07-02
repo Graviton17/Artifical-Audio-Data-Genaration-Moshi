@@ -20,7 +20,7 @@ from typing import Any
 from .agents import ConversationGeneratorAgent, TopicGeneratorAgent
 from .agents.conversation_validator_agent import ConversationValidatorAgent, AgentValidationReport
 from .agents.conversation_validator_manual import ConversationValidatorManual, ValidationReport
-from .llm import BaseLLM, KrutrimLLM
+from .llm import BaseLLM, OpenAILLM
 from .logger import Logger
 from .models import CorpusInstance
 
@@ -254,8 +254,8 @@ def read_corpus_instances(corpus_path: str) -> pd.DataFrame:
 def main() -> None:
     load_env()  # pull GROQ_API_KEY / GEMINI_API_KEY from .env
     
-    krutrim_llm = KrutrimLLM()
-    runner = ConversationRunner(llm=krutrim_llm, max_agent_attempts=3, max_manual_attempts=3)
+    openai_llm = OpenAILLM()
+    runner = ConversationRunner(llm=openai_llm, max_agent_attempts=3, max_manual_attempts=3)
 
     corpus_path = Path(__file__).resolve().parent / "data" / "corpus_instances.jsonl"
     corpus_df = read_corpus_instances(str(corpus_path))

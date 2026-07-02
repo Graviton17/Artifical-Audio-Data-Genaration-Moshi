@@ -16,6 +16,8 @@ ctc-forced-aligner    # multilingual (MMS-based) forced alignment of KNOWN text 
 # LLM providers (conversation-generation agents)
 google-genai>=1.0     # GeminiLLM
 groq>=0.11            # GroqLLM
+openai>=1.0           # OpenAILLM
+requests>=2.31        # KrutrimLLM (plain REST, no vendor SDK)
 
 # LANGFUSE
 langfuse>=2.0

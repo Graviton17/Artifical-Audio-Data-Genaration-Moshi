@@ -4,6 +4,7 @@ from .base_llm import BaseLLM, LLMError, LLMResponse, Message
 from .gemini_llm import GeminiLLM
 from .groq_llm import GroqLLM
 from .krutrim_llm import KrutrimLLM
+from .openai_llm import OpenAILLM
 
 __all__ = [
     "BaseLLM",
@@ -13,4 +14,5 @@ __all__ = [
     "GeminiLLM",
     "GroqLLM",
     "KrutrimLLM",
+    "OpenAILLM",
 ]
