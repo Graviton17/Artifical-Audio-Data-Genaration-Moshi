@@ -144,13 +144,67 @@ class ConversationRunner:
         turns: list[dict[str, Any]] = []
         report: ValidationReport | None = None
 
-        for attempt in range(1, self.max_generation_attempts + 1):
-            turns = self.generate_conversation(topic, **profile)
-            report = self.validate_conversation(turns)
-            if not report.has_errors:
-                break
+        for agent_attempt in range(1, self.max_agent_attempts + 1):
+            if agent_attempt > 1:
+                Logger.retry(f"Agent Validation Retry: Attempt {agent_attempt}/{self.max_agent_attempts}")
+            else:
+                Logger.step("Stage 2: Conversation Generation & Manual Validation")
+            
+            # Inner loop: Manual validation retries
+            for manual_attempt in range(1, self.max_manual_attempts + 1):
+                if manual_attempt > 1:
+                    Logger.retry(f"Manual Validation Retry: Attempt {manual_attempt}/{self.max_manual_attempts}")
+                
+                Logger.info("Generating conversation turns...")
+                turns = self.generate_conversation(
+                    topic, 
+                    previous_turns=previous_turns, 
+                    feedback=feedback, 
+                    **profile
+                )
+                
+                Logger.info("Running deterministic manual validation...")
+                manual_report = self.validate_conversation(turns)
+                if not manual_report.has_errors:
+                    Logger.success(f"Manual validation passed on attempt {manual_attempt}!")
+                    break
+                else:
+                    Logger.warning(f"Manual validation failed with {len(manual_report.errors)} errors.")
+                
+                # Setup feedback for the next manual retry
+                feedback = "Manual Validation Errors:\n" + "\n".join(
+                    f"- [Turn {e.turn_id}]: {e.message}" for e in manual_report.errors
+                )
+                
+                # Pass the full conversation so the LLM can see the complete
+                # context and fix structural/timing issues across all turns.
+                previous_turns = turns if turns else None
 
-        assert report is not None  # at least one attempt always runs
+            assert manual_report is not None
+            
+            if manual_report.has_errors:
+                Logger.error("Failed manual validation after all retries. Bailing out.")
+                break
+                
+            Logger.step(f"Stage 3: LLM Agent Validation (Attempt {agent_attempt}/{self.max_agent_attempts})")
+            agent_report = self.agent_validator.run(turns=turns, topic=topic, **profile)
+            if agent_report.passed:
+                Logger.success(f"Agent validation passed! (Realism: {agent_report.realism_score}, Match: {agent_report.corpus_match_score})", bold=True)
+                break
+            else:
+                Logger.warning(f"Agent validation failed. Verdict: {agent_report.verdict}")
+            
+            # Setup feedback for the next agent validation retry
+            feedback = "Agent Validation Feedback:\n"
+            if agent_report.feedback:
+                feedback += f"{agent_report.feedback}\n"
+            if agent_report.issues:
+                feedback += "\n".join(f"- ({i.severity}) [Turn {i.turn_id}]: {i.description}" for i in agent_report.issues)
+            
+            # Pass the full conversation so the LLM can see the complete
+            # context and fix issues across all turns.
+            previous_turns = turns if turns else None
+
         return {
             "topic": topic,
             "turns": turns,
