@@ -109,6 +109,8 @@ class ConversationGeneratorAgent(BaseAgent):
 
         overrides.setdefault("response_format", {"type": "json_object"})
         raw_result = self._generate_json(prompt, system_vars=system_vars, **overrides)
+        from ..logger import Logger
+        Logger.debug(f"Generator LLM Output:\n{json.dumps(raw_result, indent=2)}")
         return self._normalize(raw_result)
 
     # ------------------------------------------------------------------ #
