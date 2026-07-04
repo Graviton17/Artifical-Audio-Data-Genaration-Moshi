@@ -110,6 +110,46 @@ def _accent_guidance(agent_accent: str | None, user_accent: str | None) -> list[
     ]
 
 
+_LANGUAGE_DIRECTIVES: dict[str, str] = {
+    "hindi": (
+        "Write PREDOMINANTLY in Hindi (Devanagari script). English words are allowed "
+        "ONLY for terms with no natural Hindi equivalent (e.g. brand names, \"laptop\", "
+        "\"WiFi\"). Do NOT write full English sentences or clauses — every sentence's "
+        "grammar and structure must be Hindi."
+    ),
+    "hinglish": (
+        "Write genuine Hindi-English code-mixing: Hindi grammar, postpositions, and "
+        "verb-final sentence structure, with English nouns/verbs swapped in at natural "
+        "points. This is NOT an English sentence with a few Hindi words sprinkled in, "
+        "and NOT the same clause restated in both languages back-to-back."
+    ),
+    "english": (
+        "Write entirely in plain, natural English. Do NOT mix in Hindi words, "
+        "transliterations, or Devanagari script."
+    ),
+}
+
+
+def _language_directive(language: str | None) -> list[str]:
+    """Mandatory, unambiguous instruction for the exact requested language.
+
+    Keyed on the corpus's three supported registers (Hindi/Hinglish/English);
+    unrecognized values are left to the base system prompt.
+    """
+    if not language:
+        return []
+    directive = _LANGUAGE_DIRECTIVES.get(language.strip().lower())
+    if not directive:
+        return []
+    return [
+        "",
+        f"## MANDATORY language requirement: {language}",
+        directive,
+        "This applies to EVERY line, from the first turn to the last — do not drift "
+        "into a different register partway through.",
+    ]
+
+
 class ConversationGeneratorAgent(BaseAgent):
     """Generate a multi-turn conversation as tagged plain text.
 
@@ -188,7 +228,13 @@ class ConversationGeneratorAgent(BaseAgent):
         if conversation_type:
             system_vars["conversation_type"] = conversation_type
 
-        raw_text = self._generate(prompt, system_vars=system_vars, **overrides)
+        raw_text = self._generate(
+            prompt,
+            system_vars=system_vars,
+            stream=True,
+            stream_label=f"Generating conversation transcript ({language})…",
+            **overrides,
+        )
         transcript = self._clean(raw_text)
 
         from ..logger import Logger
@@ -224,6 +270,8 @@ class ConversationGeneratorAgent(BaseAgent):
             f"**Context:** {context}",
             f"**Language:** {language}",
         ]
+
+        lines.extend(_language_directive(language))
 
         if conversation_type:
             lines.append(f"**Conversation type:** {conversation_type}")

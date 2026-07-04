@@ -6,6 +6,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from ..llm import BaseLLM, GroqLLM
+from ..logger import Logger
 from ..prompts import resolve_system_prompt
 
 
@@ -29,12 +30,42 @@ class BaseAgent(ABC):
     # ------------------------------------------------------------------ #
     # Convenience wrappers that prepend this agent's system prompt
     # ------------------------------------------------------------------ #
-    def _generate(self, prompt: str, system_vars: dict[str, Any] | None = None, **overrides: Any) -> str:
+    def _generate(
+        self,
+        prompt: str,
+        system_vars: dict[str, Any] | None = None,
+        *,
+        stream: bool = False,
+        stream_label: str | None = None,
+        **overrides: Any,
+    ) -> str:
         system = self.langfuse_prompt.compile(**(system_vars or {}))
         full_prompt = f"{system}\n\n{prompt}"
-        return self.llm.generate(full_prompt, **overrides)
+        if not stream:
+            return self.llm.generate(full_prompt, **overrides)
 
-    def _generate_json(self, prompt: str, system_vars: dict[str, Any] | None = None, **overrides: Any) -> Any:
+        Logger.stream_start(stream_label or f"{type(self).__name__} — live output")
+        try:
+            return self.llm.generate_stream(full_prompt, on_chunk=Logger.stream_chunk, **overrides)
+        finally:
+            Logger.stream_end()
+
+    def _generate_json(
+        self,
+        prompt: str,
+        system_vars: dict[str, Any] | None = None,
+        *,
+        stream: bool = False,
+        stream_label: str | None = None,
+        **overrides: Any,
+    ) -> Any:
         system = self.langfuse_prompt.compile(**(system_vars or {}))
         full_prompt = f"{system}\n\n{prompt}"
-        return self.llm.generate_json(full_prompt, **overrides)
+        if not stream:
+            return self.llm.generate_json(full_prompt, **overrides)
+
+        Logger.stream_start(stream_label or f"{type(self).__name__} — live output")
+        try:
+            return self.llm.generate_json_stream(full_prompt, on_chunk=Logger.stream_chunk, **overrides)
+        finally:
+            Logger.stream_end()

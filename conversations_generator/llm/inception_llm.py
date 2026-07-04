@@ -8,7 +8,7 @@ no dedicated Python SDK). The API key is read from the ``api_key`` argument or
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterator
 
 import requests
 
@@ -26,7 +26,7 @@ class InceptionLLM(BaseLLM):
         model: str = "mercury-2",
         *,
         api_key: str | None = None,
-        temperature: float = 0.7,
+        temperature: float = 0.3,
         max_tokens: int | None = None,
         reasoning_effort: str | None = "low",
         max_retries: int = 3,
@@ -88,6 +88,41 @@ class InceptionLLM(BaseLLM):
             model=self.model,
             usage=self._usage(data),
             raw=data,
+        )
+
+    def _complete_stream(self, messages: list[Message], **overrides: Any) -> Iterator[str]:
+        params = self._resolved(overrides)
+
+        payload: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": params["temperature"],
+            "stream": True,
+        }
+        if params["max_tokens"] is not None:
+            payload["max_tokens"] = params["max_tokens"]
+        reasoning_effort = overrides.get("reasoning_effort", self.reasoning_effort)
+        if reasoning_effort is not None:
+            payload["reasoning_effort"] = reasoning_effort
+        if overrides.get("response_format"):
+            payload["response_format"] = overrides["response_format"]
+
+        response = requests.post(
+            _API_URL,
+            headers=self._headers,
+            json=payload,
+            timeout=self.timeout,
+            stream=True,
+        )
+        if not response.ok:
+            raise LLMError(
+                f"Inception Labs API request failed ({response.status_code}): {response.text}"
+            )
+        # The SSE stream carries UTF-8, but the server sends no charset, so
+        # requests would otherwise guess ISO-8859-1 and mangle Devanagari.
+        response.encoding = "utf-8"
+        yield from self._iter_sse_content(
+            response.iter_lines(decode_unicode=True)
         )
 
     @staticmethod

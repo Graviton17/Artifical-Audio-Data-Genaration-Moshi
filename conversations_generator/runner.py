@@ -11,16 +11,16 @@ timing, duration, turn-type distribution) before it's handed back to the caller.
     python -m conversations_generator.runner
     python -m conversations_generator.runner --language=hindi
     python -m conversations_generator.runner --language=english --model=gemini
-    python -m conversations_generator.runner --model=sarvam --validation=gemma
+    python -m conversations_generator.runner --model=sarvam --validation-model=gemma
 
 ``--language`` restricts the run to one corpus language (``hindi`` / ``hinglish``
 / ``english``); omit it to process every language, as before.
 
-``--model`` is **generation only** (topic + conversation transcript). Hindi
-instances always use Sarvam for generation; other languages use ``--model`` if
-given, else Krutrim.
+``--model`` is **generation only** (topic + conversation transcript) and always
+wins when given, for any language. Only when it's *omitted* does Hindi default
+to Sarvam and other languages default to Krutrim.
 
-``--validation`` is shared by the **formatter** and the **LLM agent validator**
+``--validation-model`` is shared by the **formatter** and the **LLM agent validator**
 (not the deterministic manual checks). Defaults to ``gemma``.
 """
 
@@ -752,13 +752,14 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         type=str.lower,
         help=(
             "LLM provider for *data generation only* (topic + conversation "
-            "transcript). Hindi instances always use 'sarvam' regardless of "
-            f"this flag; other languages use this provider if given, else "
-            f"default to '{DEFAULT_GENERATION_PROVIDER.value}'."
+            "transcript). Always wins when given, for any language. Only "
+            "when omitted does Hindi default to 'sarvam' and other "
+            f"languages default to '{DEFAULT_GENERATION_PROVIDER.value}'."
         ),
     )
     parser.add_argument(
-        "--validation",
+        "--validation-model",
+        dest="validation_model",
         choices=provider_choices,
         default=DEFAULT_VALIDATION_PROVIDER.value,
         type=str.lower,
@@ -778,7 +779,8 @@ def _get_runner(
 ) -> "ConversationRunner":
     """Return the (cached) runner for this instance's generation + validation providers.
 
-    Generation is resolved per-instance (Hindi forces Sarvam). Formatting and
+    Generation resolves per-instance, but an explicit ``model`` always wins —
+    Hindi only defaults to Sarvam when ``model`` is ``None``. Formatting and
     agent validation always use ``validation`` (default Gemma) with no language
     override. Each (generation, validation) pair is built once and reused.
     """
@@ -807,6 +809,11 @@ def _get_runner(
         validation_llm = create_llm(
             validation_provider,
             apply_language_routing=False,
+        )
+        Logger.info(
+            f"Generation model='{generation_llm.model}' (temperature={generation_llm.temperature}), "
+            f"validation/formatter model='{validation_llm.model}' (temperature={validation_llm.temperature}) "
+            "— both configurable via conversations_generator/config.json ('MODELS' / 'TEMPERATURE')."
         )
         runner_cache[cache_key] = ConversationRunner(
             llm=generation_llm,
@@ -841,9 +848,10 @@ def main(argv: list[str] | None = None) -> None:
             f"Filtered corpus to language={args.language!r}: {len(corpus_df)} instance(s)."
         )
 
+    hindi_note = "" if args.model else " (Hindi defaults to sarvam when --model is omitted)"
     Logger.info(
-        f"Providers — generation(--model)={args.model or DEFAULT_GENERATION_PROVIDER.value} "
-        f"(Hindi→sarvam), validation/formatter(--validation)={args.validation}"
+        f"Providers — generation(--model)={args.model or DEFAULT_GENERATION_PROVIDER.value}"
+        f"{hindi_note}, validation/formatter(--validation-model)={args.validation_model}"
     )
 
     # Runners are cached by (generation_provider, validation_provider) because
@@ -876,7 +884,7 @@ def main(argv: list[str] | None = None) -> None:
     for i in indices:
         row: dict[str, Any] = {str(k): v for k, v in corpus_df.iloc[i].to_dict().items()}
         instance = CorpusInstance.from_dict(row)
-        runner = _get_runner(runner_cache, args.model, args.validation, instance.language)
+        runner = _get_runner(runner_cache, args.model, args.validation_model, instance.language)
         process_instance(runner, instance, storage, checkpoint, max_conversations)
 
     Logger.divider()

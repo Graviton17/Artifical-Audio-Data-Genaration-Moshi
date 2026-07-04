@@ -61,7 +61,15 @@ class TopicGeneratorAgent(BaseAgent):
         system_vars = {"conversation_type": chosen_type}
 
         overrides.setdefault("response_format", {"type": "json_object"})
-        topic = self._normalize(self._generate_json(prompt, system_vars=system_vars, **overrides))
+        topic = self._normalize(
+            self._generate_json(
+                prompt,
+                system_vars=system_vars,
+                stream=True,
+                stream_label=f"Generating topic ({language})…",
+                **overrides,
+            )
+        )
         topic["conversation_type"] = chosen_type  # track which type was used
         self.history.append(topic)
         return topic

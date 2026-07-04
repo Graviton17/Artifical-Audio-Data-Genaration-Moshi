@@ -7,7 +7,7 @@ chat-completions API. The API key is read from the ``api_key`` argument or
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterator
 
 from ..configuration_reader import get as config_get
 from .base_llm import BaseLLM, LLMError, LLMResponse, Message
@@ -26,7 +26,7 @@ class GroqLLM(BaseLLM):
         model: str = "llama-3.3-70b-versatile",
         *,
         api_key: str | None = None,
-        temperature: float = 0.7,
+        temperature: float = 0.3,
         max_tokens: int | None = None,
         max_retries: int = 3,
         retry_backoff: float = 2.0,
@@ -71,6 +71,25 @@ class GroqLLM(BaseLLM):
             usage=self._usage(response),
             raw=response,
         )
+
+    def _complete_stream(self, messages: list[Message], **overrides: Any) -> Iterator[str]:
+        params = self._resolved(overrides)
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": params["temperature"],
+            "stream": True,
+        }
+        if params["max_tokens"] is not None:
+            kwargs["max_tokens"] = params["max_tokens"]
+        if overrides.get("response_format"):
+            kwargs["response_format"] = overrides["response_format"]
+
+        for event in self._client.chat.completions.create(**kwargs):
+            delta = event.choices[0].delta.content if event.choices else None
+            if delta:
+                yield delta
 
     @staticmethod
     def _usage(response: Any) -> dict[str, int]:

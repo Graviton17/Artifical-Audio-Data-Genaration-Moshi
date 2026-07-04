@@ -7,7 +7,7 @@ read from the ``api_key`` argument or ``GEMINI_API_KEY`` /
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 from ..configuration_reader import get as config_get
 from .base_llm import BaseLLM, LLMError, LLMResponse, Message
@@ -95,6 +95,41 @@ class GeminiLLM(BaseLLM):
 
     def _complete(self, messages: list[Message], **overrides: Any) -> LLMResponse:
         params = self._resolved(overrides)
+        contents, config = self._build_request(messages, overrides, params)
+
+        response = self._client.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=config,
+        )
+
+        self._raise_if_truncated(response, params["max_tokens"])
+
+        return LLMResponse(
+            text=response.text or "",
+            model=self.model,
+            usage=self._usage(response),
+            raw=response,
+        )
+
+    def _complete_stream(self, messages: list[Message], **overrides: Any) -> Iterator[str]:
+        params = self._resolved(overrides)
+        contents, config = self._build_request(messages, overrides, params)
+
+        for chunk in self._client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config,
+        ):
+            if chunk.text:
+                yield chunk.text
+
+    def _build_request(
+        self,
+        messages: list[Message],
+        overrides: dict[str, Any],
+        params: dict[str, Any],
+    ) -> tuple[list[Any], Any]:
         system_instruction, contents = self._split_messages(messages)
 
         mime_type = overrides.get("response_mime_type")
@@ -115,21 +150,7 @@ class GeminiLLM(BaseLLM):
             response_mime_type=mime_type,
             thinking_config=thinking_config,
         )
-
-        response = self._client.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=config,
-        )
-
-        self._raise_if_truncated(response, params["max_tokens"])
-
-        return LLMResponse(
-            text=response.text or "",
-            model=self.model,
-            usage=self._usage(response),
-            raw=response,
-        )
+        return contents, config
 
     # ------------------------------------------------------------------ #
     # Thinking config

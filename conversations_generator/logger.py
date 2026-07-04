@@ -15,6 +15,7 @@ COLORS = {
     "error": "\033[31m",    # Red
     "step": "\033[36m",     # Cyan
     "retry": "\033[35m",    # Magenta
+    "stream": "\033[96m",   # Bright cyan — live token stream
 }
 
 EMOJIS = {
@@ -76,3 +77,24 @@ class Logger:
     def divider(cls) -> None:
         """Visual divider."""
         print(f"{DIM}{'━' * 70}{RESET}")
+
+    @classmethod
+    def stream_start(cls, label: str) -> None:
+        """Header printed once before a live token stream begins."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        color = COLORS["stream"]
+        print(f"{DIM}[{timestamp}]{RESET} {color}{BOLD}📡 {label}{RESET}")
+        print(f"{DIM}{'┈' * 70}{RESET}")
+
+    @classmethod
+    def stream_chunk(cls, text: str) -> None:
+        """Print one incremental chunk of a live token stream, colorized."""
+        color = COLORS["stream"]
+        sys.stdout.write(f"{color}{text}{RESET}")
+        sys.stdout.flush()
+
+    @classmethod
+    def stream_end(cls) -> None:
+        """Footer printed once a live token stream finishes."""
+        print()
+        print(f"{DIM}{'┈' * 70}{RESET}")

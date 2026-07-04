@@ -21,6 +21,11 @@ from typing import Any
 
 _CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
 _config: dict[str, Any] | None = None
+# Untouched JSON (nested dicts / numbers preserved), unlike ``_config`` which
+# flattens everything to strings for env-var-style access via ``get``/``require``.
+_raw_config: dict[str, Any] | None = None
+
+DEFAULT_TEMPERATURE = 0.3
 
 
 class ConfigurationError(RuntimeError):
@@ -37,7 +42,7 @@ def load_config(path: str | Path | None = None, *, force_reload: bool = False) -
     force_reload :
         Re-read from disk even if a config is already cached.
     """
-    global _config
+    global _config, _raw_config
     if _config is not None and not force_reload and path is None:
         return _config
 
@@ -58,9 +63,46 @@ def load_config(path: str | Path | None = None, *, force_reload: bool = False) -
     if not isinstance(data, dict):
         raise ConfigurationError(f"Config root must be a JSON object, got {type(data).__name__}")
 
-    # Coerce everything to strings so callers can treat values like env vars.
-    _config = {str(k): ("" if v is None else str(v)) for k, v in data.items()}
+    _raw_config = data
+    # Coerce scalar values to strings so callers can treat them like env vars.
+    # Nested structures (e.g. "MODELS") are skipped here — read those via
+    # get_model()/get_raw() instead, since env-var semantics don't apply to them.
+    _config = {
+        str(k): ("" if v is None else str(v))
+        for k, v in data.items()
+        if not isinstance(v, dict)
+    }
     return _config
+
+
+def get_raw(key: str, default: Any = None) -> Any:
+    """Return ``key`` from config with its original JSON type (dict/number/etc.)."""
+    load_config()
+    assert _raw_config is not None
+    value = _raw_config.get(key)
+    return default if value is None else value
+
+
+def get_temperature(default: float = DEFAULT_TEMPERATURE) -> float:
+    """Return the shared generation temperature from ``config.json`` (default 0.3)."""
+    value = get_raw("TEMPERATURE", default)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def get_model(provider: str, default: str) -> str:
+    """Return the configured model name for ``provider`` (e.g. ``"gemini"``).
+
+    Falls back to ``default`` (the provider class's own default) when
+    ``config.json`` has no "MODELS" section or no entry for this provider.
+    """
+    models = get_raw("MODELS", {})
+    if not isinstance(models, dict):
+        return default
+    value = models.get(provider)
+    return str(value) if value else default
 
 
 def get(key: str, default: str | None = None) -> str | None:

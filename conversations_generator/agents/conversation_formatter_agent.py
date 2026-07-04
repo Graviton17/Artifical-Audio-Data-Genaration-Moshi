@@ -176,7 +176,12 @@ class ConversationFormatterAgent(BaseAgent):
         # Parsing should be near-deterministic, not creative.
         overrides.setdefault("temperature", 0.1)
         overrides.setdefault("response_format", {"type": "json_object"})
-        raw_result = self._generate_json(prompt, **overrides)
+        raw_result = self._generate_json(
+            prompt,
+            stream=True,
+            stream_label="Formatting transcript into schema turns…",
+            **overrides,
+        )
 
         from ..logger import Logger
         Logger.debug(f"Formatter LLM Output:\n{json.dumps(raw_result, indent=2, ensure_ascii=False)}")
