@@ -2,14 +2,14 @@
 
 Uses the ``openai`` SDK (``pip install openai``), which exposes the native
 chat-completions API. The API key is read from the ``api_key`` argument or
-the ``OPENAI_API_KEY`` environment variable.
+``OPENAI_API_KEY`` in ``conversations_generator/config.json``.
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
+from ..configuration_reader import get as config_get
 from .base_llm import BaseLLM, LLMError, LLMResponse, Message
 
 try:
@@ -40,9 +40,12 @@ class OpenAILLM(BaseLLM):
             max_retries=max_retries,
             retry_backoff=retry_backoff,
         )
-        key = api_key or os.getenv("OPENAI_API_KEY")
+        key = api_key or config_get("OPENAI_API_KEY")
         if not key:
-            raise LLMError("No OpenAI API key found. Pass api_key= or set OPENAI_API_KEY.")
+            raise LLMError(
+                "No OpenAI API key found. Pass api_key= or set OPENAI_API_KEY "
+                "in conversations_generator/config.json."
+            )
         self._client = OpenAI(api_key=key)
 
     def _complete(self, messages: list[Message], **overrides: Any) -> LLMResponse:

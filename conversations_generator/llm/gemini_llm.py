@@ -1,15 +1,15 @@
 """Google Gemini implementation of :class:`BaseLLM`.
 
 Uses the unified ``google-genai`` SDK (``pip install google-genai``). The API key is
-read from the ``api_key`` argument or the ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``
-environment variables.
+read from the ``api_key`` argument or ``GEMINI_API_KEY`` /
+``GOOGLE_API_KEY`` in ``conversations_generator/config.json``.
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any, Literal
 
+from ..configuration_reader import get as config_get
 from .base_llm import BaseLLM, LLMError, LLMResponse, Message
 
 try:  # Imported lazily-ish so the base package works without the SDK installed.
@@ -85,10 +85,11 @@ class GeminiLLM(BaseLLM):
         self.thinking_level = thinking_level
         self.thinking_budget = thinking_budget
         self.timeout = timeout
-        key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        key = api_key or config_get("GEMINI_API_KEY") or config_get("GOOGLE_API_KEY")
         if not key:
             raise LLMError(
-                "No Gemini API key found. Pass api_key= or set GEMINI_API_KEY."
+                "No Gemini API key found. Pass api_key= or set GEMINI_API_KEY "
+                "in conversations_generator/config.json."
             )
         self._client = genai.Client(api_key=key)
 

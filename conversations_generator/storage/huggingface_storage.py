@@ -4,11 +4,10 @@ Uses the ``huggingface_hub`` bucket API (requires ``huggingface_hub>=1.5.0``).
 Conversations and the resume checkpoint live in a HuggingFace Storage Bucket
 (the "bucket"), referenced by an ``hf://buckets/<namespace>/<name>`` path.
 
-The write token is read from the ``api_key`` argument or the ``HF_TOKEN`` /
-``HUGGINGFACE_TOKEN`` environment variables (``huggingface_hub`` also picks up
-``HF_TOKEN`` automatically). The target bucket is read from ``bucket`` or the
-``HF_BUCKET`` environment variable; both the full ``hf://buckets/ns/name`` form
-and the short ``ns/name`` form are accepted.
+The write token is read from the ``api_key`` argument or ``HF_TOKEN`` /
+``HUGGINGFACE_TOKEN`` in ``conversations_generator/config.json``. The target
+bucket is read from ``bucket`` or ``HF_BUCKET`` in the same config; both the
+full ``hf://buckets/ns/name`` form and the short ``ns/name`` form are accepted.
 
 Bucket layout::
 
@@ -28,6 +27,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from ..configuration_reader import get as config_get
 from .base_storage import BaseStorage, StorageError
 from .checkpoint import Checkpoint
 
@@ -66,19 +66,21 @@ class HuggingFaceStorage(BaseStorage):
                 "Run `pip install -U huggingface_hub`."
             )
 
-        raw = bucket or os.getenv("HF_BUCKET")
+        raw = bucket or config_get("HF_BUCKET")
         if not raw:
             raise StorageError(
                 "No HuggingFace bucket configured. Pass bucket= or set HF_BUCKET "
+                "in conversations_generator/config.json "
                 "(e.g. 'hf://buckets/Graviton17/artificial-data-conversation')."
             )
         # The bucket API takes the short 'namespace/name' form; accept either.
         self.bucket_id = raw.removeprefix(_BUCKET_PREFIX).strip("/")
 
-        self.token = api_key or os.getenv("HF_TOKEN") or os.getenv("HUGGINGFACE_TOKEN")
+        self.token = api_key or config_get("HF_TOKEN") or config_get("HUGGINGFACE_TOKEN")
         if not self.token:
             raise StorageError(
                 "No HuggingFace token found. Pass api_key= or set HF_TOKEN "
+                "in conversations_generator/config.json "
                 "(needs a WRITE token with access to the bucket's namespace)."
             )
         # huggingface_hub reads HF_TOKEN from the environment; make sure it's set

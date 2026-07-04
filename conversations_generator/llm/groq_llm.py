@@ -1,15 +1,15 @@
 """Groq implementation of :class:`BaseLLM`.
 
 Uses the ``groq`` SDK (``pip install groq``), which exposes an OpenAI-style
-chat-completions API. The API key is read from the ``api_key`` argument or the
-``GROQ_API_KEY`` environment variable.
+chat-completions API. The API key is read from the ``api_key`` argument or
+``GROQ_API_KEY`` in ``conversations_generator/config.json``.
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
+from ..configuration_reader import get as config_get
 from .base_llm import BaseLLM, LLMError, LLMResponse, Message
 
 try:
@@ -40,9 +40,12 @@ class GroqLLM(BaseLLM):
             max_retries=max_retries,
             retry_backoff=retry_backoff,
         )
-        key = api_key or os.getenv("GROQ_API_KEY")
+        key = api_key or config_get("GROQ_API_KEY")
         if not key:
-            raise LLMError("No Groq API key found. Pass api_key= or set GROQ_API_KEY.")
+            raise LLMError(
+                "No Groq API key found. Pass api_key= or set GROQ_API_KEY "
+                "in conversations_generator/config.json."
+            )
         self._client = Groq(api_key=key)
 
     def _complete(self, messages: list[Message], **overrides: Any) -> LLMResponse:

@@ -1,9 +1,14 @@
-"""Krutrim Cloud implementation of :class:`BaseLLM`.
+"""Sarvam AI implementation of :class:`BaseLLM`.
 
 Calls the OpenAI-style ``/v1/chat/completions`` endpoint at
-``https://cloud.olakrutrim.com`` directly via ``requests`` (Krutrim has no
-dedicated Python SDK). The API key is read from the ``api_key`` argument or
-``KRUTRIM_API_KEY`` in ``conversations_generator/config.json``.
+``https://api.sarvam.ai`` directly via ``requests`` (no SDK dependency needed,
+consistent with the other REST-based providers in this package). Sarvam's
+models are tuned for Indian languages, so this is the provider routed to for
+Hindi generation (see ``conversations_generator.llm.factory``).
+
+The API key is read from the ``api_key`` argument or ``SARVAM_API_KEY`` in
+``conversations_generator/config.json`` (via :mod:`configuration_reader`), and
+sent via the ``api-subscription-key`` header (Sarvam's documented auth mechanism).
 """
 
 from __future__ import annotations
@@ -15,15 +20,15 @@ import requests
 from ..configuration_reader import get as config_get
 from .base_llm import BaseLLM, LLMError, LLMResponse, Message
 
-_API_URL = "https://cloud.olakrutrim.com/v1/chat/completions"
+_API_URL = "https://api.sarvam.ai/v1/chat/completions"
 
 
-class KrutrimLLM(BaseLLM):
-    """Chat completions backed by Krutrim Cloud's hosted models (e.g. Gemma-4)."""
+class SarvamLLM(BaseLLM):
+    """Chat completions backed by Sarvam AI's hosted models (e.g. sarvam-105b)."""
 
     def __init__(
         self,
-        model: str = "gemma-4-26B-A4B-it",
+        model: str = "sarvam-105b",
         *,
         api_key: str | None = None,
         temperature: float = 0.7,
@@ -40,14 +45,14 @@ class KrutrimLLM(BaseLLM):
             retry_backoff=retry_backoff,
         )
         self.timeout = timeout
-        key = api_key or config_get("KRUTRIM_API_KEY")
+        key = api_key or config_get("SARVAM_API_KEY")
         if not key:
             raise LLMError(
-                "No Krutrim API key found. Pass api_key= or set KRUTRIM_API_KEY "
+                "No Sarvam API key found. Pass api_key= or set SARVAM_API_KEY "
                 "in conversations_generator/config.json."
             )
         self._headers = {
-            "Authorization": f"Bearer {key}",
+            "api-subscription-key": key,
             "Content-Type": "application/json",
         }
 
@@ -56,7 +61,7 @@ class KrutrimLLM(BaseLLM):
 
         payload: dict[str, Any] = {
             "model": self.model,
-            # Krutrim/OpenAI use {"role", "content"} directly; "system" role is native.
+            # Sarvam/OpenAI use {"role", "content"} directly; "system" role is native.
             "messages": messages,
             "temperature": params["temperature"],
         }
@@ -73,7 +78,7 @@ class KrutrimLLM(BaseLLM):
         )
         if not response.ok:
             raise LLMError(
-                f"Krutrim API request failed ({response.status_code}): {response.text}"
+                f"Sarvam API request failed ({response.status_code}): {response.text}"
             )
         data = response.json()
         choice = data["choices"][0]

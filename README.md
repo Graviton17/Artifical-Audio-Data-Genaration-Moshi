@@ -115,3 +115,8 @@ To add a genuinely different architecture, subclass `BaseTTS` in
   avoid resampling.
 - If `ctc-forced-aligner` is unavailable, set `aligner.name: heuristic` (or rely
   on `fallback_heuristic: true`) for deterministic char-proportional timing.
+
+
+python -m conversations_generator.runner --language=hindi
+python -m conversations_generator.runner --language=hinglish --model=gemini
+python -m conversations_generator.runner --language=english

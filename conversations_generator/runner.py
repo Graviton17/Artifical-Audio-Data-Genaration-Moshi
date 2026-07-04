@@ -9,13 +9,28 @@ generated conversation is mechanically checked (overlap/interruption/backchannel
 timing, duration, turn-type distribution) before it's handed back to the caller.
 
     python -m conversations_generator.runner
+    python -m conversations_generator.runner --language=hindi
+    python -m conversations_generator.runner --language=english --model=gemini
+    python -m conversations_generator.runner --model=sarvam --validation=gemma
+
+``--language`` restricts the run to one corpus language (``hindi`` / ``hinglish``
+/ ``english``); omit it to process every language, as before.
+
+``--model`` is **generation only** (topic + conversation transcript). Hindi
+instances always use Sarvam for generation; other languages use ``--model`` if
+given, else Krutrim.
+
+``--validation`` is shared by the **formatter** and the **LLM agent validator**
+(not the deterministic manual checks). Defaults to ``gemma``.
 """
 
 from __future__ import annotations
 
+import argparse
 import json
-import os
 import random
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -26,11 +41,24 @@ from .agents import (
 )
 from .agents.conversation_validator_agent import ConversationValidatorAgent, AgentValidationReport
 from .agents.conversation_validator_manual import ConversationValidatorManual, ValidationReport
-from .llm import BaseLLM, KrutrimLLM, LLMError
-from .loaders import load_env, read_corpus_instances
+from .configuration_reader import apply_to_environ, get as config_get
+from .llm import (
+    DEFAULT_GENERATION_PROVIDER,
+    DEFAULT_VALIDATION_PROVIDER,
+    BaseLLM,
+    LLMError,
+    LLMProvider,
+    create_llm,
+    resolve_provider,
+)
+from .loaders import read_corpus_instances
 from .logger import Logger
 from .models import CorpusInstance
 from .storage import BaseStorage, Checkpoint, HuggingFaceStorage, InstanceProgress, StorageError
+
+# Corpus languages selectable via --language, mapped case-insensitively onto
+# the corpus's actual casing ("Hindi" / "Hinglish" / "English").
+SUPPORTED_LANGUAGES = ("hindi", "hinglish", "english")
 
 
 # Target conversation duration is drawn from a Gaussian so lengths cluster
@@ -65,39 +93,43 @@ def sample_target_duration_sec(
 
 
 class ConversationRunner:
-    """Drives the pipeline agents over a shared LLM, stage by stage.
+    """Drives the pipeline agents stage by stage.
 
     Parameters
     ----------
     llm : BaseLLM | None
-        Shared LLM instance passed to every agent. ``None`` lets each agent
-        fall back to its own default (Groq).
+        Generation LLM — topic agent + conversation generator only.
+        ``None`` lets those agents fall back to their own default (Groq).
+    validation_llm : BaseLLM | None
+        Shared by the formatter agent and the LLM agent validator. When
+        ``None``, falls back to ``llm`` (same provider for everything).
     validator : ConversationValidatorManual | None
         Deterministic timing/overlap validator run after generation. Defaults
         to ``ConversationValidatorManual()`` with its standard thresholds.
-    max_generation_attempts : int
-        How many times to regenerate the conversation if manual validation
-        reports errors (not just warnings) before giving up and returning the
-        last attempt anyway. Defaults to 1 (no retry).
     """
 
     def __init__(
         self,
         llm: BaseLLM | None = None,
+        validation_llm: BaseLLM | None = None,
         validator: ConversationValidatorManual | None = None,
         max_agent_attempts: int = 3,
         max_manual_attempts: int = 3,
         max_agent_validation_retries: int = 3,
     ) -> None:
+        # Generation path: topic + plain-text conversation only.
         self.llm = llm
+        # Formatting + LLM validation path (defaults to the generation LLM when
+        # the caller doesn't split providers).
+        self.validation_llm = validation_llm if validation_llm is not None else llm
         self.topic_agent = TopicGeneratorAgent(llm)
         # Conversation generation is a two-stage pipeline: the generator writes
         # tagged plain text, the formatter turns it into schema JSON with
         # deterministic timing/overlap metadata.
         self.generator_agent = ConversationGeneratorAgent(llm)
-        self.formatter_agent = ConversationFormatterAgent(llm)
+        self.formatter_agent = ConversationFormatterAgent(self.validation_llm)
         self.validator = validator or ConversationValidatorManual()
-        self.agent_validator = ConversationValidatorAgent(llm)
+        self.agent_validator = ConversationValidatorAgent(self.validation_llm)
         self.max_agent_attempts = max(1, max_agent_attempts)
         self.max_manual_attempts = max(1, max_manual_attempts)
         # How many times to retry the agent-validation CALL if it errors out
@@ -235,7 +267,13 @@ class ConversationRunner:
         generator_feedback: str | None = None
         previous_transcript: str | None = None
 
+        # Attempt counters for local metadata (how many tries it took to pass).
+        agent_attempts_used = 0
+        manual_attempts_used = 0
+        agent_validation_attempts_used = 0
+
         for agent_attempt in range(1, self.max_agent_attempts + 1):
+            agent_attempts_used = agent_attempt
             if agent_attempt > 1:
                 Logger.retry(
                     f"Regenerating conversation (agent attempt {agent_attempt}/{self.max_agent_attempts})"
@@ -268,7 +306,9 @@ class ConversationRunner:
             turns = []
             formatter_feedback: str | None = None
             previous_output: list[dict[str, Any]] | None = None
+            manual_attempts_used = 0
             for manual_attempt in range(1, self.max_manual_attempts + 1):
+                manual_attempts_used = manual_attempt
                 if manual_attempt > 1:
                     Logger.retry(
                         f"Re-formatting (manual attempt {manual_attempt}/{self.max_manual_attempts})"
@@ -320,7 +360,9 @@ class ConversationRunner:
             # ---- Stage 4: LLM agent (content/realism) validation ----
             Logger.step(f"Stage 4: LLM Agent Validation (agent attempt {agent_attempt}/{self.max_agent_attempts})")
             agent_report = None
+            agent_validation_attempts_used = 0
             for validation_attempt in range(1, self.max_agent_validation_retries + 1):
+                agent_validation_attempts_used = validation_attempt
                 try:
                     agent_report = self.agent_validator.run(turns=turns, topic=topic, **profile)
                     break
@@ -368,6 +410,13 @@ class ConversationRunner:
             "manual_validation": manual_report,
             "agent_validation": agent_report,
             "agent_validation_bypassed": agent_validation_bypassed,
+            "target_duration_sec": target_duration_sec,
+            "agent_attempts_used": agent_attempts_used,
+            "manual_attempts_used": manual_attempts_used,
+            "agent_validation_attempts_used": agent_validation_attempts_used,
+            "max_agent_attempts": self.max_agent_attempts,
+            "max_manual_attempts": self.max_manual_attempts,
+            "max_agent_validation_retries": self.max_agent_validation_retries,
             # Accept the conversation if manual validation passed AND agent
             # validation either passed or was bypassed after exhausting retries.
             "passed": bool(
@@ -382,6 +431,10 @@ class ConversationRunner:
 # that fail validation, so a persistently-failing profile can't loop forever.
 MAX_CONSECUTIVE_FAILURES = 10
 
+# Local on-disk dump of every accepted conversation (dev and prod).
+# Layout: <repo>/output/<run_id>/conversation.json + metadata.txt
+OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
+
 
 def _conversation_payload(instance: CorpusInstance, index: int, result: dict[str, Any]) -> dict[str, Any]:
     """Build the JSON body stored for one accepted conversation."""
@@ -395,6 +448,154 @@ def _conversation_payload(instance: CorpusInstance, index: int, result: dict[str
         "passed": result.get("passed", False),
         "turns": result.get("turns", []),
     }
+
+
+def _turn_type_counts(turns: list[dict[str, Any]]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for turn in turns:
+        ttype = str(turn.get("turn_type") or "Unknown")
+        counts[ttype] = counts.get(ttype, 0) + 1
+    return counts
+
+
+def _make_run_id(instance: CorpusInstance, index: int) -> str:
+    """Unique folder name for one accepted conversation under ``output/``."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    short = uuid.uuid4().hex[:8]
+    return f"{stamp}_corpus{instance.corpus_combination_id}_conv{index:04d}_{short}"
+
+
+def _build_metadata_text(
+    run_id: str,
+    instance: CorpusInstance,
+    index: int,
+    result: dict[str, Any],
+) -> str:
+    """Human-readable metadata sidecar for an accepted conversation."""
+    topic = result.get("topic") or {}
+    turns = result.get("turns") or []
+    manual_report = result.get("manual_validation")
+    agent_report = result.get("agent_validation")
+    counts = _turn_type_counts(turns)
+    duration = getattr(manual_report, "duration_sec", None)
+    target = result.get("target_duration_sec")
+    profile = instance.to_profile()
+
+    lines = [
+        f"run_id: {run_id}",
+        f"created_at_utc: {datetime.now(timezone.utc).isoformat()}",
+        f"corpus_combination_id: {instance.corpus_combination_id}",
+        f"conversation_index: {index}",
+        f"passed: {result.get('passed', False)}",
+        "",
+        "## Topic",
+        f"title: {topic.get('title', '')}",
+        f"conversation_type: {topic.get('conversation_type', '')}",
+        f"context: {topic.get('context', '')}",
+        "",
+        "## Profile",
+        f"language: {profile.get('language', '')}",
+        f"gender_pair: {profile.get('gender_pair', '')}",
+        f"agent_emotion: {profile.get('agent_emotion', '')}",
+        f"user_emotion: {profile.get('user_emotion', '')}",
+        f"agent_accent: {profile.get('agent_accent', '')}",
+        f"user_accent: {profile.get('user_accent', '')}",
+        "",
+        "## Duration",
+        f"duration_sec: {duration}",
+        f"duration_min: {round(duration / 60, 2) if duration else None}",
+        f"target_duration_sec: {target}",
+        f"target_duration_min: {round(target / 60, 2) if target else None}",
+        "",
+        "## Turn counts",
+        f"total_turns: {len(turns)}",
+        f"backchannel_count: {counts.get('Backchanneling', 0)}",
+        f"overlap_count: {counts.get('Overlapping', 0)}",
+        f"interruption_count: {counts.get('Interruption', 0)}",
+        f"normal_count: {counts.get('Normal', 0)}",
+    ]
+    for ttype, count in sorted(counts.items()):
+        lines.append(f"  {ttype}: {count}")
+
+    agent_attempts = result.get("agent_attempts_used", 0)
+    manual_attempts = result.get("manual_attempts_used", 0)
+    validation_attempts = result.get("agent_validation_attempts_used", 0)
+    lines += [
+        "",
+        "## Retries",
+        f"agent_attempts_used: {agent_attempts} / {result.get('max_agent_attempts')}",
+        f"manual_attempts_used: {manual_attempts} / {result.get('max_manual_attempts')}",
+        f"agent_validation_attempts_used: {validation_attempts} / {result.get('max_agent_validation_retries')}",
+        f"agent_retries: {max(0, int(agent_attempts) - 1)}",
+        f"manual_retries: {max(0, int(manual_attempts) - 1)}",
+        f"agent_validation_retries: {max(0, int(validation_attempts) - 1)}",
+        f"agent_validation_bypassed: {result.get('agent_validation_bypassed', False)}",
+        "",
+        "## Agent validation",
+    ]
+    if agent_report is not None:
+        lines += [
+            f"verdict: {getattr(agent_report, 'verdict', '')}",
+            f"realism_score: {getattr(agent_report, 'realism_score', '')}",
+            f"corpus_match_score: {getattr(agent_report, 'corpus_match_score', '')}",
+        ]
+        field_matches = getattr(agent_report, "corpus_field_matches", None) or {}
+        if field_matches:
+            lines.append("corpus_field_matches:")
+            for key, matched in field_matches.items():
+                lines.append(f"  {key}: {matched}")
+        feedback = getattr(agent_report, "feedback", "") or ""
+        if feedback:
+            lines += ["", "feedback:", feedback]
+    else:
+        lines.append("verdict: (bypassed or unavailable)")
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def save_local_output(
+    instance: CorpusInstance,
+    index: int,
+    result: dict[str, Any],
+    output_dir: Path | None = None,
+) -> Path:
+    """Write an accepted conversation under ``output/<run_id>/``.
+
+    Creates:
+    * ``conversation.json`` — full payload (profile, topic, turns, …)
+    * ``metadata.txt`` — title, duration, turn-type counts, retries, scores
+    * ``transcript.txt`` — plain-text transcript for quick inspection
+
+    Returns the run folder path.
+    """
+    root = output_dir or OUTPUT_DIR
+    run_id = _make_run_id(instance, index)
+    run_dir = root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    payload = _conversation_payload(instance, index, result)
+    payload["run_id"] = run_id
+    payload["target_duration_sec"] = result.get("target_duration_sec")
+    payload["transcript"] = result.get("transcript") or ""
+
+    json_path = run_dir / "conversation.json"
+    json_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    meta_path = run_dir / "metadata.txt"
+    meta_path.write_text(
+        _build_metadata_text(run_id, instance, index, result),
+        encoding="utf-8",
+    )
+
+    transcript = result.get("transcript") or ""
+    if transcript:
+        (run_dir / "transcript.txt").write_text(transcript, encoding="utf-8")
+
+    return run_dir
 
 
 def process_instance(
@@ -482,6 +683,14 @@ def process_instance(
         consecutive_failures = 0
         accepted += 1
 
+        # Always dump accepted conversations under output/<run_id>/ so the JSON
+        # (and a metadata sidecar) is available locally regardless of ENV.
+        try:
+            local_dir = save_local_output(instance, index, result)
+            Logger.success(f"Wrote local output → {local_dir}")
+        except OSError as err:
+            Logger.warning(f"Failed to write local output for conversation {index}: {err}")
+
         if storage is not None and checkpoint is not None:
             # Upload the conversation, THEN advance + persist the checkpoint. The
             # conversation lands in the bucket before the checkpoint claims it,
@@ -504,11 +713,11 @@ def process_instance(
                 bold=True,
             )
         else:
-            # Development: count locally, don't upload.
+            # Development: count locally, don't upload to the remote bucket.
             progress.generated_sec += duration
             progress.conversation_count += 1
             Logger.success(
-                f"Conversation {index} accepted (+{duration:.0f}s, not uploaded in dev) — "
+                f"Conversation {index} accepted (+{duration:.0f}s) — "
                 f"total {progress.generated_sec:.0f}/{target_sec:.0f}s",
                 bold=True,
             )
@@ -521,25 +730,132 @@ def process_instance(
     return progress.generated_sec
 
 
-def main() -> None:
-    load_env()  # pull GROQ_API_KEY / GEMINI_API_KEY from .env
+def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    provider_choices = [p.value for p in LLMProvider]
+    parser = argparse.ArgumentParser(
+        description="Generate synthetic two-speaker conversations from the corpus."
+    )
+    parser.add_argument(
+        "--language",
+        choices=SUPPORTED_LANGUAGES,
+        default=None,
+        type=str.lower,
+        help=(
+            "Only generate conversations for this corpus language. "
+            "Omit to process every language in the corpus (default)."
+        ),
+    )
+    parser.add_argument(
+        "--model",
+        choices=provider_choices,
+        default=None,
+        type=str.lower,
+        help=(
+            "LLM provider for *data generation only* (topic + conversation "
+            "transcript). Hindi instances always use 'sarvam' regardless of "
+            f"this flag; other languages use this provider if given, else "
+            f"default to '{DEFAULT_GENERATION_PROVIDER.value}'."
+        ),
+    )
+    parser.add_argument(
+        "--validation",
+        choices=provider_choices,
+        default=DEFAULT_VALIDATION_PROVIDER.value,
+        type=str.lower,
+        help=(
+            "LLM provider for the *formatter* and *LLM agent validator* "
+            f"(not generation). Default: '{DEFAULT_VALIDATION_PROVIDER.value}'."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def _get_runner(
+    runner_cache: dict[tuple[LLMProvider, LLMProvider], "ConversationRunner"],
+    model: str | None,
+    validation: str | None,
+    language: str | None,
+) -> "ConversationRunner":
+    """Return the (cached) runner for this instance's generation + validation providers.
+
+    Generation is resolved per-instance (Hindi forces Sarvam). Formatting and
+    agent validation always use ``validation`` (default Gemma) with no language
+    override. Each (generation, validation) pair is built once and reused.
+    """
+    generation_provider = resolve_provider(
+        model,
+        language,
+        apply_language_routing=True,
+        default=DEFAULT_GENERATION_PROVIDER,
+    )
+    validation_provider = resolve_provider(
+        validation,
+        language=None,
+        apply_language_routing=False,
+        default=DEFAULT_VALIDATION_PROVIDER,
+    )
+    cache_key = (generation_provider, validation_provider)
+    if cache_key not in runner_cache:
+        Logger.info(
+            f"Initializing LLMs — generation='{generation_provider.value}', "
+            f"validation/formatter='{validation_provider.value}'..."
+        )
+        generation_llm = create_llm(
+            generation_provider,
+            apply_language_routing=False,
+        )
+        validation_llm = create_llm(
+            validation_provider,
+            apply_language_routing=False,
+        )
+        runner_cache[cache_key] = ConversationRunner(
+            llm=generation_llm,
+            validation_llm=validation_llm,
+            max_agent_attempts=3,
+            max_manual_attempts=3,
+        )
+    return runner_cache[cache_key]
+
+
+def main(argv: list[str] | None = None) -> None:
+    # Load API keys / settings from conversations_generator/config.json and
+    # mirror them into os.environ for any third-party SDK that only reads env.
+    apply_to_environ()
+    args = _parse_args(argv)
 
     # ``ENV=production`` processes every corpus instance in sequence; anything
-    # else (the default) is treated as development and runs only the first row.
-    env = os.getenv("ENV", "development").strip().lower()
+    # else (the default) is treated as development and runs only a few rows.
+    env = (config_get("ENV") or "development").strip().lower()
     is_production = env == "production"
-
-    krutrim_llm = KrutrimLLM()
-    runner = ConversationRunner(llm=krutrim_llm, max_agent_attempts=3, max_manual_attempts=3)
 
     corpus_path = Path(__file__).resolve().parent / "data" / "corpus_instances.jsonl"
     corpus_df = read_corpus_instances(str(corpus_path))
 
+    if args.language:
+        mask = corpus_df["language"].str.lower() == args.language
+        corpus_df = corpus_df[mask].reset_index(drop=True)
+        if corpus_df.empty:
+            Logger.error(f"No corpus instances found for language={args.language!r}.")
+            return
+        Logger.step(
+            f"Filtered corpus to language={args.language!r}: {len(corpus_df)} instance(s)."
+        )
+
+    Logger.info(
+        f"Providers — generation(--model)={args.model or DEFAULT_GENERATION_PROVIDER.value} "
+        f"(Hindi→sarvam), validation/formatter(--validation)={args.validation}"
+    )
+
+    # Runners are cached by (generation_provider, validation_provider) because
+    # generation can differ per instance (Hindi → Sarvam) while validation is
+    # fixed for the whole CLI invocation.
+    runner_cache: dict[tuple[LLMProvider, LLMProvider], ConversationRunner] = {}
+
     # Storage + checkpoint are production-only. Dev runs entirely in memory.
     storage: BaseStorage | None = None
     checkpoint: Checkpoint | None = None
-    # In development, cap at a single conversation for iloc[0]; production chases
-    # each instance's full duration target.
+    # In development, cap at a single conversation per instance; production
+    # chases each instance's full duration target.
     max_conversations: int | None = None
     if is_production:
         Logger.step(f"PRODUCTION run — processing all {len(corpus_df)} instances in sequence.")
@@ -548,13 +864,19 @@ def main() -> None:
         Logger.info(f"Loaded checkpoint with {len(checkpoint.instances)} instance record(s).")
         indices = range(len(corpus_df))
     else:
-        Logger.step("DEVELOPMENT run — generating a single conversation for instance iloc[0] (no upload).")
-        indices = [234, 0, 135]
+        Logger.step("DEVELOPMENT run — generating a single conversation per instance (no upload).")
+        # Without a language filter, keep the original hand-picked indices for
+        # variety across the full corpus; with a filter, just take the first
+        # few rows of the (already language-scoped) corpus.
+        indices = [i for i in (234, 0, 135) if i < len(corpus_df)] if not args.language else list(
+            range(min(3, len(corpus_df)))
+        )
         max_conversations = 1
 
     for i in indices:
         row: dict[str, Any] = {str(k): v for k, v in corpus_df.iloc[i].to_dict().items()}
         instance = CorpusInstance.from_dict(row)
+        runner = _get_runner(runner_cache, args.model, args.validation, instance.language)
         process_instance(runner, instance, storage, checkpoint, max_conversations)
 
     Logger.divider()

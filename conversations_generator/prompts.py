@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
-import os
 from typing import Any
+
+from .configuration_reader import get as config_get
 
 _client: Any | None = None
 
@@ -18,10 +19,13 @@ def _get_client() -> Any:
     if _client is not None:
         return _client
 
-    if not (os.getenv("LANGFUSE_PUBLIC_KEY") and os.getenv("LANGFUSE_SECRET_KEY")):
+    public_key = config_get("LANGFUSE_PUBLIC_KEY")
+    secret_key = config_get("LANGFUSE_SECRET_KEY")
+    if not (public_key and secret_key):
         raise PromptResolutionError(
             "Langfuse is not configured. Set LANGFUSE_PUBLIC_KEY and "
-            "LANGFUSE_SECRET_KEY (and LANGFUSE_HOST if self-hosted)."
+            "LANGFUSE_SECRET_KEY in conversations_generator/config.json "
+            "(and LANGFUSE_BASE_URL if self-hosted)."
         )
 
     try:
@@ -31,7 +35,15 @@ def _get_client() -> Any:
             "langfuse is not installed. Run `pip install langfuse`."
         ) from err
 
-    _client = Langfuse()
+    host = config_get("LANGFUSE_BASE_URL") or config_get("LANGFUSE_HOST")
+    kwargs: dict[str, Any] = {
+        "public_key": public_key,
+        "secret_key": secret_key,
+    }
+    if host:
+        kwargs["host"] = host
+
+    _client = Langfuse(**kwargs)
     return _client
 
 

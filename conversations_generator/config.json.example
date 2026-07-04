@@ -1,0 +1,14 @@
+{
+  "SARVAM_API_KEY": "sk_your_sarvam_key",
+  "GROQ_API_KEY": "gsk_your_groq_key",
+  "GEMINI_API_KEY": "your_gemini_key",
+  "KRUTRIM_API_KEY": "your_krutrim_key",
+  "OPENAI_API_KEY": "sk-proj-your_openai_key",
+  "INCEPTION_API_KEY": "sk_your_inception_key",
+  "LANGFUSE_SECRET_KEY": "sk-lf-your_langfuse_secret",
+  "LANGFUSE_PUBLIC_KEY": "pk-lf-your_langfuse_public",
+  "LANGFUSE_BASE_URL": "https://jp.cloud.langfuse.com",
+  "ENV": "development",
+  "HF_TOKEN": "hf_your_huggingface_token",
+  "HF_BUCKET": "hf://buckets/Graviton17/artificial-data-conversation"
+}

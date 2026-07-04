@@ -3,16 +3,16 @@
 Calls the OpenAI-style ``/v1/chat/completions`` endpoint at
 ``https://api.inceptionlabs.ai`` directly via ``requests`` (Inception Labs has
 no dedicated Python SDK). The API key is read from the ``api_key`` argument or
-the ``INCEPTION_API_KEY`` environment variable.
+``INCEPTION_API_KEY`` in ``conversations_generator/config.json``.
 """
 
 from __future__ import annotations
 
-import os
 from typing import Any
 
 import requests
 
+from ..configuration_reader import get as config_get
 from .base_llm import BaseLLM, LLMError, LLMResponse, Message
 
 _API_URL = "https://api.inceptionlabs.ai/v1/chat/completions"
@@ -42,10 +42,11 @@ class InceptionLLM(BaseLLM):
         )
         self.reasoning_effort = reasoning_effort
         self.timeout = timeout
-        key = api_key or os.getenv("INCEPTION_API_KEY")
+        key = api_key or config_get("INCEPTION_API_KEY")
         if not key:
             raise LLMError(
-                "No Inception Labs API key found. Pass api_key= or set INCEPTION_API_KEY."
+                "No Inception Labs API key found. Pass api_key= or set "
+                "INCEPTION_API_KEY in conversations_generator/config.json."
             )
         self._headers = {
             "Authorization": f"Bearer {key}",
