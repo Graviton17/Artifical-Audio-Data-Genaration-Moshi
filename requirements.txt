@@ -12,3 +12,15 @@ ctc-forced-aligner    # multilingual (MMS-based) forced alignment of KNOWN text 
 
 # The concrete TTS model (IndicMioTTS) pulls its own weights at runtime via transformers.
 # Swap the model id in config.yaml if `SPRINGLab/Indic-Mio` does not resolve.
+
+# LLM providers (conversation-generation agents)
+google-genai>=1.0     # GeminiLLM
+groq>=0.11            # GroqLLM
+openai>=1.0           # OpenAILLM
+requests>=2.31        # KrutrimLLM (plain REST, no vendor SDK)
+
+# LANGFUSE
+langfuse>=2.0
+
+# Storage (production conversation bucket + checkpoint on HuggingFace Hub)
+huggingface_hub>=1.5.0   # bucket API: create_bucket / batch_bucket_files / download_bucket_files

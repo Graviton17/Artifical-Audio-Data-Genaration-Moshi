@@ -9,6 +9,7 @@ description = "Synthetic two-speaker conversational audio generator for Moshi fu
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
+    "pandas>=2.0",
     "pyyaml>=6.0",
     "soundfile>=0.12",
 ]
@@ -20,9 +21,14 @@ ml = [
     "ctc-forced-aligner",
     "sphn==0.1.12",
 ]
+llm = [
+    "google-genai>=1.0",   # GeminiLLM
+    "groq>=0.11",          # GroqLLM
+    "langfuse>=2.0",       # Prompt management
+]
 
 [tool.setuptools.packages.find]
-include = ["datagen*"]
+include = ["datagen*", "conversations_generator*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
