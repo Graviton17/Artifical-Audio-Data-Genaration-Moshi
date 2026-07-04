@@ -117,6 +117,19 @@ To add a genuinely different architecture, subclass `BaseTTS` in
   on `fallback_heuristic: true`) for deterministic char-proportional timing.
 
 
+
+
+
+<!-- IMP  -->
+
+python -m conversations_generator.runner --language=hindi
+# generation=sarvam (forced), validation/formatter=gemma
+
+python -m conversations_generator.runner --language=english --model=gemini
+# generation=gemini, validation/formatter=gemma
+
+python -m conversations_generator.runner --model=sarvam --validation=gemini
+# generation=sarvam, validation/formatter=gemini
 python -m conversations_generator.runner --language=hindi
 python -m conversations_generator.runner --language=hinglish --model=gemini
 python -m conversations_generator.runner --language=english
