@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+from ..configuration_reader import get_agent_temperature
 from ..llm import BaseLLM, GroqLLM
 from ..logger import Logger
 from ..prompts import resolve_system_prompt
@@ -14,6 +15,10 @@ class BaseAgent(ABC):
     """Common wiring shared by every agent."""
 
     prompt_name: str | None = None
+    # Key into config.json's "AGENT_TEMPERATURES" section. When set, this agent's
+    # LLM calls default to that temperature (unless the caller passes one
+    # explicitly), so each stage's sampling temperature is managed centrally.
+    temperature_key: str | None = None
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
         if not self.prompt_name:
@@ -21,6 +26,11 @@ class BaseAgent(ABC):
         # Default provider is Groq; pass any BaseLLM to use a different one.
         self.llm = llm if llm is not None else GroqLLM()
         self.langfuse_prompt = resolve_system_prompt(self.prompt_name)
+
+    def _apply_agent_temperature(self, overrides: dict[str, Any]) -> None:
+        """Inject this agent's configured temperature unless one was passed in."""
+        if self.temperature_key and "temperature" not in overrides:
+            overrides["temperature"] = get_agent_temperature(self.temperature_key)
 
     @abstractmethod
     def run(self, *args: Any, **kwargs: Any) -> Any:
@@ -41,6 +51,7 @@ class BaseAgent(ABC):
     ) -> str:
         system = self.langfuse_prompt.compile(**(system_vars or {}))
         full_prompt = f"{system}\n\n{prompt}"
+        self._apply_agent_temperature(overrides)
         if not stream:
             return self.llm.generate(full_prompt, **overrides)
 
@@ -61,6 +72,7 @@ class BaseAgent(ABC):
     ) -> Any:
         system = self.langfuse_prompt.compile(**(system_vars or {}))
         full_prompt = f"{system}\n\n{prompt}"
+        self._apply_agent_temperature(overrides)
         if not stream:
             return self.llm.generate_json(full_prompt, **overrides)
 

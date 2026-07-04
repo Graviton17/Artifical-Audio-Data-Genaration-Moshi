@@ -35,6 +35,7 @@ from pathlib import Path
 from typing import Any
 
 from .agents import (
+    ConversationEditorAgent,
     ConversationFormatterAgent,
     ConversationGeneratorAgent,
     TopicGeneratorAgent,
@@ -116,6 +117,7 @@ class ConversationRunner:
         max_agent_attempts: int = 3,
         max_manual_attempts: int = 3,
         max_agent_validation_retries: int = 3,
+        max_edit_attempts: int = 2,
     ) -> None:
         # Generation path: topic + plain-text conversation only.
         self.llm = llm
@@ -130,11 +132,17 @@ class ConversationRunner:
         self.formatter_agent = ConversationFormatterAgent(self.validation_llm)
         self.validator = validator or ConversationValidatorManual()
         self.agent_validator = ConversationValidatorAgent(self.validation_llm)
+        # Repairs a failing conversation with targeted per-turn edits instead of
+        # regenerating the whole thing. Uses the generation LLM (it owns dialogue
+        # content), falling back to the validation LLM if generation is unset.
+        self.editor_agent = ConversationEditorAgent(llm if llm is not None else self.validation_llm)
         self.max_agent_attempts = max(1, max_agent_attempts)
         self.max_manual_attempts = max(1, max_manual_attempts)
         # How many times to retry the agent-validation CALL if it errors out
         # (bad/unparseable LLM response) before bypassing the step entirely.
         self.max_agent_validation_retries = max(1, max_agent_validation_retries)
+        # How many targeted-edit passes to try before giving up and regenerating.
+        self.max_edit_attempts = max(1, max_edit_attempts)
 
     # ------------------------------------------------------------------ #
     # Stage 1: topic
@@ -233,12 +241,17 @@ class ConversationRunner:
                     # to the FORMATTER (transcript unchanged) and retry
                 if manual validation still failing: regenerate transcript (outer)
                 if agent_validation(turns) passes: done
-                # else feed agent errors + previous TRANSCRIPT (not the formatted
-                # turns) back to the GENERATOR and regenerate (outer)
+                # else FIRST try targeted edits (Stage 4b): patch only the flagged
+                # turns in place, re-lay-out timing, re-validate — up to
+                # max_edit_attempts passes. If that fixes it: done, no regeneration.
+                # Only if editing can't be applied / doesn't pass do we fall back to
+                # feeding agent errors + previous TRANSCRIPT back to the GENERATOR
+                # and regenerating the whole conversation (outer).
 
-        So the **inner** loop only re-runs the formatter to fix *formatting*, while
-        the **outer** loop re-runs the generator to fix *content* — each stage gets
-        feedback targeted at the artefact it owns.
+        So the **inner** loop only re-runs the formatter to fix *formatting*, the
+        **edit** stage surgically fixes flagged *content* without discarding the
+        good turns, and the **outer** loop re-runs the generator only when editing
+        isn't enough — each stage gets feedback targeted at the artefact it owns.
 
         Returns
         -------
@@ -359,18 +372,7 @@ class ConversationRunner:
 
             # ---- Stage 4: LLM agent (content/realism) validation ----
             Logger.step(f"Stage 4: LLM Agent Validation (agent attempt {agent_attempt}/{self.max_agent_attempts})")
-            agent_report = None
-            agent_validation_attempts_used = 0
-            for validation_attempt in range(1, self.max_agent_validation_retries + 1):
-                agent_validation_attempts_used = validation_attempt
-                try:
-                    agent_report = self.agent_validator.run(turns=turns, topic=topic, **profile)
-                    break
-                except (ValueError, LLMError) as err:
-                    Logger.warning(
-                        f"Agent validation call failed "
-                        f"(attempt {validation_attempt}/{self.max_agent_validation_retries}): {err}"
-                    )
+            agent_report, agent_validation_attempts_used = self._run_agent_validation(turns, topic, profile)
 
             # Still couldn't get a verdict after all retries — bypass the step and
             # accept the conversation, which already passed manual validation.
@@ -391,13 +393,38 @@ class ConversationRunner:
                 break
 
             Logger.warning(f"Agent validation failed. Verdict: {agent_report.verdict}")
+
+            # ---- Stage 4b: TARGETED EDITS before falling back to full regeneration ----
+            # Try to fix only the flagged turns (edit in place) rather than throwing
+            # away the whole conversation and regenerating from scratch.
+            edit_result = self._repair_by_editing(turns, topic, agent_report, profile)
+            if edit_result is not None:
+                turns, edited_manual_report, edited_agent_report = edit_result
+                manual_report = edited_manual_report
+                if edited_agent_report is None:
+                    # Re-validation was unavailable after edits; accept the edited,
+                    # manual-valid conversation (same policy as the bypass above).
+                    agent_validation_bypassed = True
+                    agent_report = None
+                    break
+                agent_report = edited_agent_report
+                if agent_report.passed:
+                    Logger.success(
+                        f"Targeted edits fixed the conversation! (Realism: "
+                        f"{agent_report.realism_score}, Match: {agent_report.corpus_match_score})",
+                        bold=True,
+                    )
+                    break
+                # Edits helped but didn't fully pass — regenerate, now with the
+                # LATEST issues from the edited conversation.
+
             # Feedback for the next GENERATOR attempt (outer loop): pass the agent's
             # errors and the previous TRANSCRIPT (not the formatted turns), since the
             # generator owns the dialogue content the agent validator judged.
             generator_feedback = "Agent Validation Feedback:\n"
-            if agent_report.feedback:
+            if agent_report and agent_report.feedback:
                 generator_feedback += f"{agent_report.feedback}\n"
-            if agent_report.issues:
+            if agent_report and agent_report.issues:
                 generator_feedback += "\n".join(
                     f"- ({i.severity}) [Turn {i.turn_id}]: {i.description}" for i in agent_report.issues
                 )
@@ -425,6 +452,120 @@ class ConversationRunner:
                 and (agent_validation_bypassed or (agent_report and agent_report.passed))
             ),
         }
+
+    # ------------------------------------------------------------------ #
+    # Stage 4 helpers
+    # ------------------------------------------------------------------ #
+    def _run_agent_validation(
+        self,
+        turns: list[dict[str, Any]],
+        topic: dict[str, str],
+        profile: dict[str, Any],
+    ) -> tuple[AgentValidationReport | None, int]:
+        """Call the LLM agent validator, retrying transient call failures.
+
+        Returns ``(report, attempts_used)``; ``report`` is ``None`` if every
+        attempt raised (unparseable/failed response), so the caller can bypass.
+        """
+        report: AgentValidationReport | None = None
+        attempts_used = 0
+        for validation_attempt in range(1, self.max_agent_validation_retries + 1):
+            attempts_used = validation_attempt
+            try:
+                report = self.agent_validator.run(turns=turns, topic=topic, **profile)
+                break
+            except (ValueError, LLMError) as err:
+                Logger.warning(
+                    f"Agent validation call failed "
+                    f"(attempt {validation_attempt}/{self.max_agent_validation_retries}): {err}"
+                )
+        return report, attempts_used
+
+    def _repair_by_editing(
+        self,
+        turns: list[dict[str, Any]],
+        topic: dict[str, str],
+        agent_report: AgentValidationReport,
+        profile: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], ValidationReport, AgentValidationReport | None] | None:
+        """Fix a failing conversation with targeted per-turn edits.
+
+        Repeatedly asks the editor agent for a minimal patch addressing the
+        validator's issues, applies it (which deterministically re-lays-out
+        timing), re-checks manual validation, then re-judges with the agent
+        validator — up to ``max_edit_attempts`` passes.
+
+        Returns ``(edited_turns, manual_report, agent_report)`` where
+        ``agent_report`` is the latest verdict (or ``None`` if re-validation was
+        unavailable). Returns ``None`` when editing can't be applied at all
+        (editor error, no edits proposed, patch rejected, or the edited turns
+        fail manual validation) — the caller then falls back to full regeneration.
+        """
+        current_turns = turns
+        current_report = agent_report
+        manual_report: ValidationReport | None = None
+
+        for edit_attempt in range(1, self.max_edit_attempts + 1):
+            Logger.step(
+                f"Stage 4b: Targeted edit repair (attempt {edit_attempt}/{self.max_edit_attempts})"
+            )
+            try:
+                edits = self.editor_agent.run(
+                    turns=current_turns,
+                    issues=current_report.issues,
+                    feedback=current_report.feedback,
+                    **profile,
+                )
+            except (ValueError, LLMError) as err:
+                Logger.warning(f"Editor call failed: {err}. Falling back to regeneration.")
+                return None
+
+            if not edits:
+                Logger.info("Editor proposed no edits. Falling back to regeneration.")
+                return None
+
+            Logger.info(f"Applying {len(edits)} targeted edit(s) in place...")
+            try:
+                edited_turns = self.formatter_agent.apply_edits(
+                    current_turns,
+                    edits,
+                    agent_emotion=profile.get("agent_emotion"),
+                    user_emotion=profile.get("user_emotion"),
+                )
+            except (ValueError, LLMError) as err:
+                Logger.warning(f"Applying edits failed: {err}. Falling back to regeneration.")
+                return None
+
+            manual_report = self.validate_conversation(edited_turns)
+            if manual_report.has_errors:
+                Logger.warning(
+                    f"Edited conversation failed manual validation "
+                    f"({len(manual_report.errors)} errors). Falling back to regeneration."
+                )
+                return None
+
+            Logger.success(f"Edits applied and passed manual validation (attempt {edit_attempt}).")
+            current_turns = edited_turns
+
+            # Re-judge the edited conversation.
+            new_report, _ = self._run_agent_validation(current_turns, topic, profile)
+            if new_report is None:
+                Logger.warning("Agent re-validation unavailable after edits; accepting edited conversation.")
+                return current_turns, manual_report, None
+            if new_report.passed:
+                return current_turns, manual_report, new_report
+
+            Logger.warning(
+                f"Edited conversation still failing (verdict {new_report.verdict}); "
+                "trying another edit pass." if edit_attempt < self.max_edit_attempts
+                else f"Edited conversation still failing (verdict {new_report.verdict})."
+            )
+            current_report = new_report
+
+        # Edit passes exhausted without a PASS — hand back the best-effort edited
+        # turns and the latest verdict so the caller decides (regenerate).
+        assert manual_report is not None
+        return current_turns, manual_report, current_report
 
 
 # Safety cap: give up on an instance after this many *consecutive* generations

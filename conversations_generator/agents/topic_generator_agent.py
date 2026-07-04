@@ -27,6 +27,7 @@ class TopicGeneratorAgent(BaseAgent):
     """Generate conversation topics one per call, avoiding past repeats."""
 
     prompt_name = "topic-generator-agent"
+    temperature_key = "topic"
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
         super().__init__(llm)

@@ -92,6 +92,24 @@ def get_temperature(default: float = DEFAULT_TEMPERATURE) -> float:
         return default
 
 
+def get_agent_temperature(agent: str, default: float | None = None) -> float:
+    """Return the configured sampling temperature for a specific agent.
+
+    Reads ``config.json``'s "AGENT_TEMPERATURES" section (keys like ``"topic"``,
+    ``"conversation"``, ``"formatter"``, ``"validator"``) so each pipeline stage
+    can be tuned centrally. Falls back to ``default`` if given, else the global
+    :func:`get_temperature`, when there's no per-agent entry.
+    """
+    temps = get_raw("AGENT_TEMPERATURES", {})
+    value = temps.get(agent) if isinstance(temps, dict) else None
+    if value is None:
+        return default if default is not None else get_temperature()
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default if default is not None else get_temperature()
+
+
 def get_model(provider: str, default: str) -> str:
     """Return the configured model name for ``provider`` (e.g. ``"gemini"``).
 
