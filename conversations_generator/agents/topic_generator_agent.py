@@ -44,9 +44,15 @@ class TopicGeneratorAgent(BaseAgent):
         agent_accent: str | None = None,
         user_accent: str | None = None,
         gender_pair: str | None = None,
+        include_numbers: bool = False,
         **overrides: Any,
     ) -> dict[str, str]:
-        """Generate the next single topic and append it to :attr:`history`."""
+        """Generate the next single topic and append it to :attr:`history`.
+
+        ``include_numbers`` steers whether the topic is chosen so that concrete
+        numbers naturally come up in the conversation (see the runner, which
+        toggles this per-conversation from ``NUMBER_INCLUSION_PERCENTAGE``).
+        """
         # Pick a random conversation type if none was explicitly provided.
         chosen_type = conversation_type or random.choice(CONVERSATION_TYPES)
 
@@ -57,6 +63,7 @@ class TopicGeneratorAgent(BaseAgent):
             agent_accent=agent_accent,
             user_accent=user_accent,
             gender_pair=gender_pair,
+            include_numbers=include_numbers,
         )
 
         system_vars = {"conversation_type": chosen_type}
@@ -91,11 +98,27 @@ class TopicGeneratorAgent(BaseAgent):
         agent_accent: str | None = None,
         user_accent: str | None = None,
         gender_pair: str | None = None,
+        include_numbers: bool = False,
     ) -> str:
         lines = [
             "Generate ONE new conversation topic.",
             f"Language of the conversations: {language}.",
         ]
+        if include_numbers:
+            lines.append(
+                "This topic MUST be one where concrete numbers naturally come up "
+                "and can be discussed with reasoning — e.g. prices/budgets, dates "
+                "and durations, quantities, percentages/discounts, measurements, "
+                "ages, scores, distances, or phone/order/account numbers. Pick a "
+                "title and context that clearly invite specific figures (and the "
+                "explanation/comparison around them) during the conversation."
+            )
+        else:
+            lines.append(
+                "This topic should flow naturally as a mostly qualitative "
+                "discussion — do NOT centre it on statistics or figures; specific "
+                "numbers should not be needed to have the conversation."
+            )
         if agent_emotion:
             lines.append(f"Agent's emotional tone: {agent_emotion}.")
         if user_emotion:

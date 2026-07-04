@@ -150,6 +150,38 @@ def _language_directive(language: str | None) -> list[str]:
     ]
 
 
+def _number_directive(include_numbers: bool) -> list[str]:
+    """Prompt block controlling whether the conversation is number-rich.
+
+    ``include_numbers=True`` requires several concrete figures *with the
+    reasoning around them*; ``False`` keeps the dialogue qualitative. Toggled
+    per-conversation by the runner from ``NUMBER_INCLUSION_PERCENTAGE``.
+    """
+    if include_numbers:
+        return [
+            "",
+            "## Numbers (MANDATORY for this conversation)",
+            "Weave several CONCRETE numbers naturally into the dialogue — e.g. "
+            "prices/amounts, dates, durations, quantities, percentages/discounts, "
+            "measurements, ages, scores, or distances — AND the reasoning around "
+            "them: speakers should state specific figures and then explain, "
+            "justify, compare, or do simple math with them (why a price is high, "
+            "how a discount was calculated, comparing two options, splitting a "
+            "cost, etc.), not just drop a number in isolation. Spell numbers the "
+            "way people actually SAY them aloud in this language (this is spoken "
+            "audio data), not as bare digits where that would sound unnatural. "
+            "Keep it realistic — a few well-motivated numbers across the "
+            "conversation, not a figure crammed into every line.",
+        ]
+    return [
+        "",
+        "## Numbers",
+        "Keep this conversation qualitative: do NOT force in statistics or "
+        "specific figures. Only use a number if it is genuinely unavoidable and "
+        "natural for a passing remark.",
+    ]
+
+
 class ConversationGeneratorAgent(BaseAgent):
     """Generate a multi-turn conversation as tagged plain text.
 
@@ -178,6 +210,7 @@ class ConversationGeneratorAgent(BaseAgent):
         previous_transcript: str | None = None,
         feedback: str | None = None,
         target_duration_sec: float | None = None,
+        include_numbers: bool = False,
         **overrides: Any,
     ) -> str:
         """Generate a full conversation for the given topic, as plain text.
@@ -202,6 +235,10 @@ class ConversationGeneratorAgent(BaseAgent):
             Validation feedback describing what was wrong with the previous attempt.
         target_duration_sec : float | None
             Approximate target duration to pace turn count against.
+        include_numbers : bool
+            When True, the dialogue must weave in concrete numbers with reasoning;
+            when False it stays qualitative. Toggled per-conversation by the runner
+            from ``NUMBER_INCLUSION_PERCENTAGE`` in config.json.
         **overrides
             Extra kwargs forwarded to the LLM (temperature, max_tokens, etc.).
 
@@ -223,6 +260,7 @@ class ConversationGeneratorAgent(BaseAgent):
             previous_transcript=previous_transcript,
             feedback=feedback,
             target_duration_sec=target_duration_sec,
+            include_numbers=include_numbers,
         )
 
         system_vars: dict[str, Any] = {}
@@ -260,6 +298,7 @@ class ConversationGeneratorAgent(BaseAgent):
         previous_transcript: str | None,
         feedback: str | None,
         target_duration_sec: float | None = None,
+        include_numbers: bool = False,
     ) -> str:
         """Assemble the user-side prompt sent alongside the Langfuse system prompt."""
         lines: list[str] = [
@@ -301,6 +340,9 @@ class ConversationGeneratorAgent(BaseAgent):
                 f"minutes) when spoken at a natural pace (~2-3 words/second). Write "
                 f"enough turns and content to fill it — do not end early."
             )
+
+        # Number inclusion is decided per-conversation by the runner.
+        lines.extend(_number_directive(include_numbers))
 
         if previous_transcript and feedback:
             lines.append("")

@@ -9,7 +9,7 @@ process. Prefer reading keys through this module instead of sharing a ``.env``.
 
     load_config()                       # optional — first get/require also loads
     key = require("SARVAM_API_KEY")
-    env = get("ENV", "development")
+    mode = get_mode()                   # "dev" or "prod"
 """
 
 from __future__ import annotations
@@ -90,6 +90,41 @@ def get_temperature(default: float = DEFAULT_TEMPERATURE) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def get_mode() -> str:
+    """Return the run mode, normalized to ``"dev"`` or ``"prod"``.
+
+    Reads ``config.json``'s ``MODE`` (values ``dev``/``prod`` or
+    ``development``/``production`` are all accepted), defaulting to ``"dev"``.
+    This single switch drives both prompt source (dev → local prompt files,
+    prod → Langfuse) and storage (dev → local only, prod → upload to HuggingFace).
+    """
+    raw = get("MODE") or "dev"
+    return "prod" if raw.strip().lower() in {"prod", "production"} else "dev"
+
+
+def is_production() -> bool:
+    """True when running in production mode (see :func:`get_mode`)."""
+    return get_mode() == "prod"
+
+
+def get_number_inclusion_percentage(default: float = 0.5) -> float:
+    """Fraction (0.0–1.0) of conversations that should be number-rich.
+
+    Read from ``config.json``'s "NUMBER_INCLUSION_PERCENTAGE". Each conversation
+    independently draws this: on a hit it's generated with concrete numbers and
+    their reasoning; otherwise it stays qualitative. Accepts either a fraction
+    (``0.5``) or a percentage (``50``); values are clamped to [0, 1].
+    """
+    value = get_raw("NUMBER_INCLUSION_PERCENTAGE", default)
+    try:
+        pct = float(value)
+    except (TypeError, ValueError):
+        return default
+    if pct > 1.0:  # tolerate "50" meaning 50%
+        pct = pct / 100.0
+    return max(0.0, min(1.0, pct))
 
 
 def get_agent_temperature(agent: str, default: float | None = None) -> float:

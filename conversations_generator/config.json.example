@@ -8,7 +8,25 @@
   "LANGFUSE_SECRET_KEY": "sk-lf-your_langfuse_secret",
   "LANGFUSE_PUBLIC_KEY": "pk-lf-your_langfuse_public",
   "LANGFUSE_BASE_URL": "https://jp.cloud.langfuse.com",
-  "ENV": "development",
+  "MODE": "prod",
   "HF_TOKEN": "hf_your_huggingface_token",
-  "HF_BUCKET": "hf://buckets/Graviton17/artificial-data-conversation"
+  "HF_BUCKET": "hf://buckets/Graviton17/artificial-data-conversation",
+  "TEMPERATURE": 0.3,
+  "NUMBER_INCLUSION_PERCENTAGE": 0.65,
+  "AGENT_TEMPERATURES": {
+    "topic": 0.6,
+    "conversation": 0.3,
+    "formatter": 0.3,
+    "validator": 0.3,
+    "editor": 0.3
+  },
+  "MODELS": {
+    "krutrim": "gemma-4-26B-A4B-it",
+    "gemma": "gemma-4-26B-A4B-it",
+    "sarvam": "sarvam-30b",
+    "gemini": "gemini-3.5-flash",
+    "groq": "llama-3.3-70b-versatile",
+    "openai": "gpt-4.1",
+    "inception": "mercury-2"
+  }
 }

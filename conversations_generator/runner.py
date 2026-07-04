@@ -42,7 +42,12 @@ from .agents import (
 )
 from .agents.conversation_validator_agent import ConversationValidatorAgent, AgentValidationReport
 from .agents.conversation_validator_manual import ConversationValidatorManual, ValidationReport
-from .configuration_reader import apply_to_environ, get as config_get
+from .configuration_reader import (
+    apply_to_environ,
+    get_mode,
+    get_number_inclusion_percentage,
+    is_production,
+)
 from .llm import (
     DEFAULT_GENERATION_PROVIDER,
     DEFAULT_VALIDATION_PROVIDER,
@@ -259,7 +264,16 @@ class ConversationRunner:
             agent_validation, agent_validation_bypassed, passed.
         """
         Logger.step(f"Starting pipeline for language: {profile.get('language', 'unknown')}")
-        topic = self.generate_topic(**profile)
+
+        # Decide ONCE per conversation whether this one is number-rich, drawn from
+        # NUMBER_INCLUSION_PERCENTAGE (default 50%). Fixed for the whole pipeline
+        # (topic + every regeneration/edit) so the topic and dialogue stay aligned.
+        include_numbers = random.random() < get_number_inclusion_percentage()
+        Logger.info(
+            f"Number inclusion: {'ON — numbers + reasoning' if include_numbers else 'OFF — qualitative'}"
+        )
+
+        topic = self.generate_topic(include_numbers=include_numbers, **profile)
 
         # Draw one exact target duration for this conversation from the Gaussian
         # so lengths follow the intended 4–8 min distribution. Sampled once and
@@ -304,6 +318,7 @@ class ConversationRunner:
                     previous_transcript=previous_transcript,
                     feedback=generator_feedback,
                     target_duration_sec=target_duration_sec,
+                    include_numbers=include_numbers,
                     **profile,
                 )
             except (ValueError, LLMError) as err:
@@ -438,6 +453,7 @@ class ConversationRunner:
             "agent_validation": agent_report,
             "agent_validation_bypassed": agent_validation_bypassed,
             "target_duration_sec": target_duration_sec,
+            "include_numbers": include_numbers,
             "agent_attempts_used": agent_attempts_used,
             "manual_attempts_used": manual_attempts_used,
             "agent_validation_attempts_used": agent_validation_attempts_used,
@@ -587,6 +603,7 @@ def _conversation_payload(instance: CorpusInstance, index: int, result: dict[str
         "topic": result.get("topic") or {},
         "duration_sec": getattr(manual_report, "duration_sec", None),
         "passed": result.get("passed", False),
+        "include_numbers": result.get("include_numbers", False),
         "turns": result.get("turns", []),
     }
 
@@ -628,6 +645,7 @@ def _build_metadata_text(
         f"corpus_combination_id: {instance.corpus_combination_id}",
         f"conversation_index: {index}",
         f"passed: {result.get('passed', False)}",
+        f"include_numbers: {result.get('include_numbers', False)}",
         "",
         "## Topic",
         f"title: {topic.get('title', '')}",
@@ -825,7 +843,7 @@ def process_instance(
         accepted += 1
 
         # Always dump accepted conversations under output/<run_id>/ so the JSON
-        # (and a metadata sidecar) is available locally regardless of ENV.
+        # (and a metadata sidecar) is available locally regardless of MODE.
         try:
             local_dir = save_local_output(instance, index, result)
             Logger.success(f"Wrote local output → {local_dir}")
@@ -971,10 +989,15 @@ def main(argv: list[str] | None = None) -> None:
     apply_to_environ()
     args = _parse_args(argv)
 
-    # ``ENV=production`` processes every corpus instance in sequence; anything
-    # else (the default) is treated as development and runs only a few rows.
-    env = (config_get("ENV") or "development").strip().lower()
-    is_production = env == "production"
+    # ``MODE=prod`` (config.json) processes every corpus instance in sequence and
+    # uploads to HuggingFace; anything else is development — local prompts, local
+    # dumps only, and just a few rows. Same switch also picks the prompt source
+    # (see prompts.resolve_system_prompt).
+    production = is_production()
+    Logger.step(
+        f"MODE = {get_mode()}  →  prompts: {'Langfuse (local fallback)' if production else 'local files'}, "
+        f"storage: {'HuggingFace upload' if production else 'local only'}"
+    )
 
     corpus_path = Path(__file__).resolve().parent / "data" / "corpus_instances.jsonl"
     corpus_df = read_corpus_instances(str(corpus_path))
@@ -1006,7 +1029,7 @@ def main(argv: list[str] | None = None) -> None:
     # In development, cap at a single conversation per instance; production
     # chases each instance's full duration target.
     max_conversations: int | None = None
-    if is_production:
+    if production:
         Logger.step(f"PRODUCTION run — processing all {len(corpus_df)} instances in sequence.")
         storage = HuggingFaceStorage()
         checkpoint = storage.load_checkpoint()
