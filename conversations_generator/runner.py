@@ -20,11 +20,22 @@ from pathlib import Path
 from typing import Any
 
 from .agents import ConversationGeneratorAgent, TopicGeneratorAgent
+from .agents.conversation_fixer_agent import ConversationFixerAgent
 from .agents.conversation_validator_agent import ConversationValidatorAgent, AgentValidationReport
 from .agents.conversation_validator_manual import ConversationValidatorManual, ValidationReport
 from .llm import BaseLLM, GeminiLLM, LLMError
 from .logger import Logger
 from .models import CorpusInstance
+from .patching import (
+    AttemptHistory,
+    FeedbackItem,
+    blocking_items,
+    collect_target_ids,
+    from_agent_report,
+    from_manual_report,
+    merge_patch,
+    render_feedback,
+)
 from .storage import BaseStorage, Checkpoint, HuggingFaceStorage, InstanceProgress, StorageError
 
 
@@ -90,30 +101,47 @@ class ConversationRunner:
     validator : ConversationValidatorManual | None
         Deterministic timing/overlap validator run after generation. Defaults
         to ``ConversationValidatorManual()`` with its standard thresholds.
-    max_generation_attempts : int
-        How many times to regenerate the conversation if manual validation
-        reports errors (not just warnings) before giving up and returning the
-        last attempt anyway. Defaults to 1 (no retry).
+    max_patch_rounds : int
+        How many targeted-patch rounds to attempt. Each round validates the
+        current conversation and, if it fails, rewrites only the flagged (and
+        structurally linked) turns via :class:`ConversationFixerAgent` instead
+        of regenerating the whole thing. Defaults to 4.
+    max_regen_fallback : int
+        If targeted patching is exhausted without acceptance, how many times to
+        fall back to full-conversation regeneration before giving up. Defaults
+        to 2. Set to 0 to disable the fallback (patch-only).
+    max_agent_validation_retries : int
+        How many times to retry the agent-validation CALL if it errors out
+        (bad/unparseable LLM response) before bypassing the step entirely.
+    max_agent_attempts, max_manual_attempts : int
+        Deprecated, retained for backward compatibility with existing callers;
+        no longer used by the patch-based loop.
     """
 
     def __init__(
         self,
         llm: BaseLLM | None = None,
         validator: ConversationValidatorManual | None = None,
+        max_patch_rounds: int = 4,
+        max_regen_fallback: int = 2,
+        max_agent_validation_retries: int = 3,
         max_agent_attempts: int = 3,
         max_manual_attempts: int = 3,
-        max_agent_validation_retries: int = 3,
     ) -> None:
         self.llm = llm
         self.topic_agent = TopicGeneratorAgent(llm)
         self.conversation_agent = ConversationGeneratorAgent(llm)
+        self.fixer_agent = ConversationFixerAgent(llm)
         self.validator = validator or ConversationValidatorManual()
         self.agent_validator = ConversationValidatorAgent(llm)
-        self.max_agent_attempts = max(1, max_agent_attempts)
-        self.max_manual_attempts = max(1, max_manual_attempts)
+        self.max_patch_rounds = max(1, max_patch_rounds)
+        self.max_regen_fallback = max(0, max_regen_fallback)
         # How many times to retry the agent-validation CALL if it errors out
         # (bad/unparseable LLM response) before bypassing the step entirely.
         self.max_agent_validation_retries = max(1, max_agent_validation_retries)
+        # Deprecated knobs kept so existing constructor calls don't break.
+        self.max_agent_attempts = max(1, max_agent_attempts)
+        self.max_manual_attempts = max(1, max_manual_attempts)
 
     # ------------------------------------------------------------------ #
     # Stage 1: topic
@@ -179,146 +207,280 @@ class ConversationRunner:
         return self.validator.validate(turns, time_field=time_field)
 
     # ------------------------------------------------------------------ #
+    # Validation helpers
+    # ------------------------------------------------------------------ #
+    def _run_agent_validation(
+        self, turns: list[dict[str, Any]], topic: dict[str, str], profile: dict[str, Any],
+    ) -> tuple[AgentValidationReport | None, bool]:
+        """Call the LLM judge with retries.
+
+        Returns ``(report, bypassed)``. ``bypassed`` is ``True`` when the call
+        kept failing and the step was skipped — the conversation is then accepted
+        on the strength of manual validation alone (mirrors the old behaviour).
+        """
+        for attempt in range(1, self.max_agent_validation_retries + 1):
+            try:
+                return self.agent_validator.run(turns=turns, topic=topic, **profile), False
+            except (ValueError, LLMError) as err:
+                Logger.warning(
+                    f"Agent validation call failed "
+                    f"(attempt {attempt}/{self.max_agent_validation_retries}): {err}"
+                )
+        Logger.warning(
+            f"Agent validation unavailable after {self.max_agent_validation_retries} "
+            "retries. Bypassing agent validation for this conversation."
+        )
+        return None, True
+
+    def _evaluate(
+        self, turns: list[dict[str, Any]], topic: dict[str, str], profile: dict[str, Any],
+    ) -> tuple[ValidationReport, AgentValidationReport | None, bool, list[FeedbackItem]]:
+        """Validate a conversation and collect turn-scoped feedback.
+
+        Runs manual validation first (cheap, deterministic); only runs the LLM
+        judge if manual validation has no errors. Returns
+        ``(manual_report, agent_report, agent_bypassed, feedback_items)`` where
+        ``feedback_items`` merges both validators' findings.
+        """
+        Logger.info("Running deterministic manual validation...")
+        manual_report = self.validate_conversation(turns)
+        feedback: list[FeedbackItem] = from_manual_report(manual_report)
+
+        if manual_report.has_errors:
+            Logger.warning(f"Manual validation failed with {len(manual_report.errors)} error(s).")
+            return manual_report, None, False, feedback
+
+        Logger.info("Manual validation passed. Running LLM agent validation...")
+        agent_report, bypassed = self._run_agent_validation(turns, topic, profile)
+        if bypassed:
+            return manual_report, None, True, feedback
+        if agent_report is not None and not agent_report.passed:
+            feedback += from_agent_report(agent_report)
+        return manual_report, agent_report, False, feedback
+
+    @staticmethod
+    def _is_accepted(
+        manual_report: ValidationReport | None,
+        agent_report: AgentValidationReport | None,
+        agent_bypassed: bool,
+    ) -> bool:
+        """Accept when manual passed AND the judge passed or was bypassed."""
+        return bool(
+            manual_report
+            and not manual_report.has_errors
+            and (agent_bypassed or (agent_report and agent_report.passed))
+        )
+
+    # ------------------------------------------------------------------ #
     # Entry point
     # ------------------------------------------------------------------ #
     def run(self, **profile: Any) -> dict[str, Any]:
-        """Run the full pipeline: topic → conversation → manual validation → agent validation.
+        """Run the full pipeline: topic → generate → validate → *patch only what failed*.
 
-        Regenerates the conversation up to `max_agent_attempts` times based on
-        agent validation. For each agent attempt, it retries up to `max_manual_attempts`
-        times based on manual validation.
+        The conversation is generated once (blank file → full conversation), then
+        validated. On failure, instead of regenerating everything, only the
+        flagged turns (and the turns they're structurally linked to) are rewritten
+        by :class:`ConversationFixerAgent` and spliced back in — up to
+        ``max_patch_rounds`` times. If patching can't get it accepted, it falls
+        back to full regeneration up to ``max_regen_fallback`` times.
 
         Returns
         -------
         dict with keys:
-            topic : dict        — output of stage 1
-            turns : list[dict]  — output of stage 2 (last attempt)
-            manual_validation : ValidationReport — output of manual validation
-            agent_validation : AgentValidationReport | None — output of agent validation
-            passed : bool       — True if final attempt passed all checks
+            topic : dict
+            turns : list[dict]                      — final conversation
+            manual_validation : ValidationReport
+            agent_validation : AgentValidationReport | None
+            agent_validation_bypassed : bool
+            passed : bool
         """
         Logger.step(f"Starting pipeline for language: {profile.get('language', 'unknown')}")
         topic = self.generate_topic(**profile)
 
         # Draw one exact target duration for this conversation from the Gaussian
-        # so lengths follow the intended 5–10 min distribution. Sampled once and
-        # reused across all retries so every regeneration aims for the same target.
+        # so lengths follow the intended distribution. Sampled once and reused
+        # across all patch/regen rounds so every attempt aims for the same target.
         target_duration_sec = sample_target_duration_sec()
         Logger.info(
             f"Target conversation duration: {target_duration_sec:.1f}s "
             f"({target_duration_sec / 60:.2f} min)"
         )
 
+        history = AttemptHistory()
+
+        # ---- Stage 2: initial full generation (blank file → full conversation)
+        Logger.step("Stage 2: Initial conversation generation")
         turns: list[dict[str, Any]] = []
+        try:
+            turns = self.generate_conversation(
+                topic, target_duration_sec=target_duration_sec, **profile
+            )
+        except (ValueError, LLMError) as err:
+            Logger.error(f"Initial conversation generation failed: {err}")
+
         manual_report: ValidationReport | None = None
         agent_report: AgentValidationReport | None = None
+        agent_bypassed = False
 
-        previous_turns: list[dict[str, Any]] | None = None
-        feedback: str | None = None
-        agent_validation_bypassed = False
+        # ---- Stage 3: targeted patch loop -------------------------------------
+        Logger.step("Stage 3: Validation & targeted patching")
+        last_phase = "generation"
+        last_targets: list[str] = []
+        latest_blocking: list[FeedbackItem] = []
 
-        for agent_attempt in range(1, self.max_agent_attempts + 1):
-            if agent_attempt > 1:
-                Logger.retry(f"Agent Validation Retry: Attempt {agent_attempt}/{self.max_agent_attempts}")
-            else:
-                Logger.step("Stage 2: Conversation Generation & Manual Validation")
-            
-            # Inner loop: Manual validation retries
-            for manual_attempt in range(1, self.max_manual_attempts + 1):
-                if manual_attempt > 1:
-                    Logger.retry(f"Manual Validation Retry: Attempt {manual_attempt}/{self.max_manual_attempts}")
-                
-                Logger.info("Generating conversation turns...")
-                try:
-                    turns = self.generate_conversation(
-                        topic,
-                        previous_turns=previous_turns,
-                        feedback=feedback,
-                        target_duration_sec=target_duration_sec,
-                        **profile
-                    )
-                except (ValueError, LLMError) as err:
-                    Logger.warning(f"Conversation generation failed: {err}")
-                    manual_report = None
-                    feedback = f"Conversation generation error on the previous attempt: {err}"
-                    previous_turns = None
-                    continue
-
-                Logger.info("Running deterministic manual validation...")
-                manual_report = self.validate_conversation(turns)
-                if not manual_report.has_errors:
-                    Logger.success(f"Manual validation passed on attempt {manual_attempt}!")
-                    break
-                else:
-                    Logger.warning(f"Manual validation failed with {len(manual_report.errors)} errors.")
-                
-                # Setup feedback for the next manual retry
-                feedback = "Manual Validation Errors:\n" + "\n".join(
-                    f"- [Turn {e.turn_id}]: {e.message}" for e in manual_report.errors
-                )
-                
-                # Pass all previous turns so the generator has full context
-                previous_turns = turns if turns else None
-
-            if manual_report is None:
-                Logger.error("Conversation generation kept failing across all manual retries. Bailing out.")
+        for rnd in range(1, self.max_patch_rounds + 1):
+            if not turns:
                 break
 
-            if manual_report.has_errors:
-                Logger.error("Failed manual validation after all retries. Bailing out.")
-                break
-                
-            Logger.step(f"Stage 3: LLM Agent Validation (Attempt {agent_attempt}/{self.max_agent_attempts})")
-            agent_report = None
-            for validation_attempt in range(1, self.max_agent_validation_retries + 1):
-                try:
-                    agent_report = self.agent_validator.run(turns=turns, topic=topic, **profile)
-                    break
-                except (ValueError, LLMError) as err:
-                    Logger.warning(
-                        f"Agent validation call failed "
-                        f"(attempt {validation_attempt}/{self.max_agent_validation_retries}): {err}"
-                    )
+            manual_report, agent_report, agent_bypassed, feedback = self._evaluate(
+                turns, topic, profile
+            )
+            history.record(
+                round_no=rnd, phase=last_phase, feedback=feedback, target_turn_ids=last_targets
+            )
 
-            # Still couldn't get a verdict after all retries — bypass the step and
-            # accept the conversation, which already passed manual validation.
-            if agent_report is None:
+            if self._is_accepted(manual_report, agent_report, agent_bypassed):
+                Logger.success(f"Conversation accepted after {rnd} round(s).", bold=True)
+                return self._result(topic, turns, manual_report, agent_report, agent_bypassed)
+
+            blocking = blocking_items(feedback)
+            latest_blocking = blocking
+            flagged = sorted({i.turn_id for i in blocking if i.is_turn_scoped and i.turn_id})
+            target_ids = collect_target_ids(turns, set(flagged))
+
+            if not target_ids:
                 Logger.warning(
-                    f"Agent validation unavailable after {self.max_agent_validation_retries} "
-                    "retries. Bypassing agent validation for this conversation."
+                    "No turn-scoped issues left to patch (remaining problems are "
+                    "conversation-level). Escalating to full regeneration."
                 )
-                agent_validation_bypassed = True
                 break
 
-            if agent_report.passed:
-                Logger.success(f"Agent validation passed! (Realism: {agent_report.realism_score}, Match: {agent_report.corpus_match_score})", bold=True)
+            if rnd == self.max_patch_rounds:
+                Logger.warning("Patch-round budget exhausted.")
                 break
-            else:
-                Logger.warning(f"Agent validation failed. Verdict: {agent_report.verdict}")
-            
-            # Setup feedback for the next agent validation retry
-            feedback = "Agent Validation Feedback:\n"
-            if agent_report.feedback:
-                feedback += f"{agent_report.feedback}\n"
-            if agent_report.issues:
-                feedback += "\n".join(f"- ({i.severity}) [Turn {i.turn_id}]: {i.description}" for i in agent_report.issues)
-            
-            # Pass all previous turns so the generator has full context
-            previous_turns = turns if turns else None
 
+            Logger.retry(
+                f"Patch round {rnd}/{self.max_patch_rounds}: fixing turns "
+                f"{target_ids} ({len(blocking)} blocking issue(s))."
+            )
+            try:
+                patch_result = self.fixer_agent.run(
+                    turns=turns,
+                    target_ids=target_ids,
+                    feedback=blocking,
+                    topic=topic,
+                    history=history,
+                    **profile,
+                )
+            except (ValueError, LLMError) as err:
+                Logger.warning(f"Fixer call failed: {err}. Escalating to full regeneration.")
+                break
+
+            if patch_result.dropped_ids:
+                Logger.warning(
+                    f"Fixer tried to edit turns outside the allowed set (ignored): "
+                    f"{patch_result.dropped_ids}"
+                )
+            if not patch_result.patch:
+                Logger.warning("Fixer returned no usable patch. Escalating to full regeneration.")
+                break
+
+            turns, applied = merge_patch(turns, patch_result.patch, allowed_ids=set(target_ids))
+            Logger.success(f"Applied patch to turns: {applied}")
+            last_phase, last_targets = "patch", applied
+
+        # ---- Fallback: full regeneration --------------------------------------
+        if not self._is_accepted(manual_report, agent_report, agent_bypassed):
+            turns, manual_report, agent_report, agent_bypassed = self._regen_fallback(
+                topic=topic,
+                turns=turns,
+                blocking=latest_blocking,
+                target_duration_sec=target_duration_sec,
+                history=history,
+                profile=profile,
+            )
+
+        return self._result(topic, turns, manual_report, agent_report, agent_bypassed)
+
+    def _regen_fallback(
+        self,
+        *,
+        topic: dict[str, str],
+        turns: list[dict[str, Any]],
+        blocking: list[FeedbackItem],
+        target_duration_sec: float,
+        history: AttemptHistory,
+        profile: dict[str, Any],
+    ) -> tuple[list[dict[str, Any]], ValidationReport | None, AgentValidationReport | None, bool]:
+        """Full-conversation regeneration used when targeted patching can't pass.
+
+        Regenerates the whole conversation from the accumulated feedback up to
+        ``max_regen_fallback`` times, re-validating each time. Returns the last
+        attempt's ``(turns, manual_report, agent_report, agent_bypassed)``.
+        """
+        manual_report: ValidationReport | None = None
+        agent_report: AgentValidationReport | None = None
+        agent_bypassed = False
+
+        if self.max_regen_fallback == 0:
+            return turns, manual_report, agent_report, agent_bypassed
+
+        Logger.step("Fallback: full-conversation regeneration")
+        feedback_text = "Fix these issues from the previous attempt:\n" + (
+            render_feedback(blocking) or "(the conversation failed validation)"
+        )
+        previous = turns if turns else None
+
+        for attempt in range(1, self.max_regen_fallback + 1):
+            Logger.retry(f"Full regeneration attempt {attempt}/{self.max_regen_fallback}")
+            try:
+                turns = self.generate_conversation(
+                    topic,
+                    previous_turns=previous,
+                    feedback=feedback_text,
+                    target_duration_sec=target_duration_sec,
+                    **profile,
+                )
+            except (ValueError, LLMError) as err:
+                Logger.warning(f"Regeneration failed: {err}")
+                continue
+
+            manual_report, agent_report, agent_bypassed, feedback = self._evaluate(
+                turns, topic, profile
+            )
+            history.record(
+                round_no=self.max_patch_rounds + attempt,
+                phase="regeneration",
+                feedback=feedback,
+                target_turn_ids=[],
+            )
+            if self._is_accepted(manual_report, agent_report, agent_bypassed):
+                Logger.success(f"Conversation accepted after regeneration attempt {attempt}.", bold=True)
+                break
+
+            previous = turns
+            feedback_text = "Fix these issues from the previous attempt:\n" + (
+                render_feedback(blocking_items(feedback)) or "(the conversation failed validation)"
+            )
+
+        return turns, manual_report, agent_report, agent_bypassed
+
+    @staticmethod
+    def _result(
+        topic: dict[str, str],
+        turns: list[dict[str, Any]],
+        manual_report: ValidationReport | None,
+        agent_report: AgentValidationReport | None,
+        agent_bypassed: bool,
+    ) -> dict[str, Any]:
+        """Assemble the runner's return payload (shape unchanged from before)."""
         return {
             "topic": topic,
             "turns": turns,
             "manual_validation": manual_report,
             "agent_validation": agent_report,
-            "agent_validation_bypassed": agent_validation_bypassed,
-            # Accept the conversation if manual validation passed AND agent
-            # validation either passed or was bypassed after exhausting retries.
-            "passed": bool(
-                manual_report
-                and not manual_report.has_errors
-                and (agent_validation_bypassed or (agent_report and agent_report.passed))
-            ),
+            "agent_validation_bypassed": agent_bypassed,
+            "passed": ConversationRunner._is_accepted(manual_report, agent_report, agent_bypassed),
         }
 
 
