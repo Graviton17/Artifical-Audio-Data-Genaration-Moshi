@@ -1,11 +1,12 @@
 """Orchestration for the conversation-generation pipeline.
 
 A single :class:`BaseLLM` is created once and shared by every agent, so switching
-provider (Groq by default) is one argument. The runner now drives three stages —
-topic generation, conversation generation, and manual timing validation — so
-every generated conversation is mechanically checked (overlap/interruption/
-backchannel timing, duration, turn-type distribution) before it's handed back
-to the caller.
+provider (Groq by default) is one argument. The runner drives the pipeline in
+stages — topic generation, conversation generation (a plain-text *generator*
+followed by a JSON *formatter* that assigns deterministic timing/overlap
+metadata), manual timing validation, and LLM agent validation — so every
+generated conversation is mechanically checked (overlap/interruption/backchannel
+timing, duration, turn-type distribution) before it's handed back to the caller.
 
     python -m conversations_generator.runner
 """
@@ -15,37 +16,21 @@ from __future__ import annotations
 import json
 import os
 import random
-import pandas as pd
 from pathlib import Path
 from typing import Any
 
-from .agents import ConversationGeneratorAgent, TopicGeneratorAgent
+from .agents import (
+    ConversationFormatterAgent,
+    ConversationGeneratorAgent,
+    TopicGeneratorAgent,
+)
 from .agents.conversation_validator_agent import ConversationValidatorAgent, AgentValidationReport
 from .agents.conversation_validator_manual import ConversationValidatorManual, ValidationReport
-from .llm import BaseLLM, GeminiLLM, LLMError
+from .llm import BaseLLM, KrutrimLLM, LLMError
+from .loaders import load_env, read_corpus_instances
 from .logger import Logger
 from .models import CorpusInstance
 from .storage import BaseStorage, Checkpoint, HuggingFaceStorage, InstanceProgress, StorageError
-
-
-def load_env(filename: str = ".env") -> None:
-    """Load ``KEY=VALUE`` pairs from a .env file into ``os.environ``.
-
-    Walks up from this file to the repo root looking for ``filename``. Existing
-    environment variables win, so real env config is never overwritten. Zero
-    dependencies; use python-dotenv instead if you later add it.
-    """
-    for parent in Path(__file__).resolve().parents:
-        candidate = parent / filename
-        if candidate.is_file():
-            for line in candidate.read_text().splitlines():
-                line = line.strip()
-                if not line or line.startswith("#") or "=" not in line:
-                    continue
-                key, _, value = line.partition("=")
-                key, value = key.strip(), value.strip().strip('"').strip("'")
-                os.environ.setdefault(key, value)
-            return
 
 
 # Target conversation duration is drawn from a Gaussian so lengths cluster
@@ -106,7 +91,11 @@ class ConversationRunner:
     ) -> None:
         self.llm = llm
         self.topic_agent = TopicGeneratorAgent(llm)
-        self.conversation_agent = ConversationGeneratorAgent(llm)
+        # Conversation generation is a two-stage pipeline: the generator writes
+        # tagged plain text, the formatter turns it into schema JSON with
+        # deterministic timing/overlap metadata.
+        self.generator_agent = ConversationGeneratorAgent(llm)
+        self.formatter_agent = ConversationFormatterAgent(llm)
         self.validator = validator or ConversationValidatorManual()
         self.agent_validator = ConversationValidatorAgent(llm)
         self.max_agent_attempts = max(1, max_agent_attempts)
@@ -131,19 +120,23 @@ class ConversationRunner:
     def generate_conversation(
         self,
         topic: dict[str, str],
-        previous_turns: list[dict[str, Any]] | None = None,
+        previous_transcript: str | None = None,
         feedback: str | None = None,
         target_duration_sec: float | None = None,
         **profile: Any,
-    ) -> list[dict[str, Any]]:
-        """Generate a full conversation from a topic dict.
+    ) -> tuple[str, list[dict[str, Any]]]:
+        """Generate a full conversation from a topic dict, in two stages.
+
+        Stage 2a: the generator agent writes a tagged plain-text transcript.
+        Stage 2b: the formatter agent converts it into schema turn dicts with
+        deterministic timing/overlap metadata.
 
         Parameters
         ----------
         topic : dict
             Must contain ``title`` and ``context`` (output of stage 1).
-        previous_turns : list[dict] | None
-            The previous turn to learn from, if validation failed.
+        previous_transcript : str | None
+            The previous attempt's transcript to learn from, if validation failed.
         feedback : str | None
             Validation feedback string.
         target_duration_sec : float | None
@@ -151,16 +144,28 @@ class ConversationRunner:
             drawn from the Gaussian in :func:`sample_target_duration_sec`.
         **profile
             Language, emotion, accent, gender_pair, etc.
+
+        Returns
+        -------
+        tuple[str, list[dict]]
+            The raw plain-text transcript and the formatted schema turns.
         """
-        return self.conversation_agent.run(
+        transcript = self.generator_agent.run(
             title=topic["title"],
             context=topic.get("context", ""),
             conversation_type=topic.get("conversation_type"),
-            previous_turns=previous_turns,
+            previous_transcript=previous_transcript,
             feedback=feedback,
             target_duration_sec=target_duration_sec,
             **profile,
         )
+        turns = self.formatter_agent.run(
+            transcript=transcript,
+            agent_emotion=profile.get("agent_emotion"),
+            user_emotion=profile.get("user_emotion"),
+            language=profile.get("language"),
+        )
+        return transcript, turns
 
     # ------------------------------------------------------------------ #
     # Stage 3: manual validation
@@ -182,26 +187,37 @@ class ConversationRunner:
     # Entry point
     # ------------------------------------------------------------------ #
     def run(self, **profile: Any) -> dict[str, Any]:
-        """Run the full pipeline: topic → conversation → manual validation → agent validation.
+        """Run the full pipeline with a two-level retry loop.
 
-        Regenerates the conversation up to `max_agent_attempts` times based on
-        agent validation. For each agent attempt, it retries up to `max_manual_attempts`
-        times based on manual validation.
+        Flow::
+
+            topic = generate_topic()
+            for agent_attempt in range(max_agent_attempts):      # OUTER
+                transcript = generator_agent(...)                # one transcript per outer attempt
+                for manual_attempt in range(max_manual_attempts):  # INNER
+                    turns = formatter_agent(transcript, ...)
+                    if manual_validation(turns) passes: break
+                    # else feed manual errors + previous formatted turns back
+                    # to the FORMATTER (transcript unchanged) and retry
+                if manual validation still failing: regenerate transcript (outer)
+                if agent_validation(turns) passes: done
+                # else feed agent errors + previous TRANSCRIPT (not the formatted
+                # turns) back to the GENERATOR and regenerate (outer)
+
+        So the **inner** loop only re-runs the formatter to fix *formatting*, while
+        the **outer** loop re-runs the generator to fix *content* — each stage gets
+        feedback targeted at the artefact it owns.
 
         Returns
         -------
-        dict with keys:
-            topic : dict        — output of stage 1
-            turns : list[dict]  — output of stage 2 (last attempt)
-            manual_validation : ValidationReport — output of manual validation
-            agent_validation : AgentValidationReport | None — output of agent validation
-            passed : bool       — True if final attempt passed all checks
+        dict with keys: topic, transcript, turns, manual_validation,
+            agent_validation, agent_validation_bypassed, passed.
         """
         Logger.step(f"Starting pipeline for language: {profile.get('language', 'unknown')}")
         topic = self.generate_topic(**profile)
 
         # Draw one exact target duration for this conversation from the Gaussian
-        # so lengths follow the intended 5–10 min distribution. Sampled once and
+        # so lengths follow the intended 4–8 min distribution. Sampled once and
         # reused across all retries so every regeneration aims for the same target.
         target_duration_sec = sample_target_duration_sec()
         Logger.info(
@@ -210,38 +226,69 @@ class ConversationRunner:
         )
 
         turns: list[dict[str, Any]] = []
+        transcript: str = ""
         manual_report: ValidationReport | None = None
         agent_report: AgentValidationReport | None = None
-
-        previous_turns: list[dict[str, Any]] | None = None
-        feedback: str | None = None
         agent_validation_bypassed = False
+
+        # Feedback threaded to the GENERATOR across outer attempts.
+        generator_feedback: str | None = None
+        previous_transcript: str | None = None
 
         for agent_attempt in range(1, self.max_agent_attempts + 1):
             if agent_attempt > 1:
-                Logger.retry(f"Agent Validation Retry: Attempt {agent_attempt}/{self.max_agent_attempts}")
+                Logger.retry(
+                    f"Regenerating conversation (agent attempt {agent_attempt}/{self.max_agent_attempts})"
+                )
             else:
-                Logger.step("Stage 2: Conversation Generation & Manual Validation")
-            
-            # Inner loop: Manual validation retries
+                Logger.step("Stage 2: Conversation Generation")
+
+            # ---- Stage 2a: generate the plain-text transcript ONCE per outer attempt ----
+            Logger.info("Generating conversation transcript (plain text)...")
+            try:
+                transcript = self.generator_agent.run(
+                    title=topic["title"],
+                    context=topic.get("context", ""),
+                    conversation_type=topic.get("conversation_type"),
+                    previous_transcript=previous_transcript,
+                    feedback=generator_feedback,
+                    target_duration_sec=target_duration_sec,
+                    **profile,
+                )
+            except (ValueError, LLMError) as err:
+                Logger.warning(f"Transcript generation failed: {err}")
+                manual_report = None
+                generator_feedback = f"Conversation generation error on the previous attempt: {err}"
+                previous_transcript = None
+                continue
+
+            # ---- Stage 2b + 3: format + manual validation (INNER loop, formatter only) ----
+            Logger.step("Stage 3: Formatting & Manual Validation")
+            manual_report = None
+            turns = []
+            formatter_feedback: str | None = None
+            previous_output: list[dict[str, Any]] | None = None
             for manual_attempt in range(1, self.max_manual_attempts + 1):
                 if manual_attempt > 1:
-                    Logger.retry(f"Manual Validation Retry: Attempt {manual_attempt}/{self.max_manual_attempts}")
-                
-                Logger.info("Generating conversation turns...")
+                    Logger.retry(
+                        f"Re-formatting (manual attempt {manual_attempt}/{self.max_manual_attempts})"
+                    )
+
+                Logger.info("Formatting transcript into schema turns...")
                 try:
-                    turns = self.generate_conversation(
-                        topic,
-                        previous_turns=previous_turns,
-                        feedback=feedback,
-                        target_duration_sec=target_duration_sec,
-                        **profile
+                    turns = self.formatter_agent.run(
+                        transcript=transcript,
+                        agent_emotion=profile.get("agent_emotion"),
+                        user_emotion=profile.get("user_emotion"),
+                        language=profile.get("language"),
+                        feedback=formatter_feedback,
+                        previous_output=previous_output,
                     )
                 except (ValueError, LLMError) as err:
-                    Logger.warning(f"Conversation generation failed: {err}")
+                    Logger.warning(f"Formatting failed: {err}")
                     manual_report = None
-                    feedback = f"Conversation generation error on the previous attempt: {err}"
-                    previous_turns = None
+                    formatter_feedback = f"Formatting error on the previous attempt: {err}"
+                    previous_output = None
                     continue
 
                 Logger.info("Running deterministic manual validation...")
@@ -249,26 +296,29 @@ class ConversationRunner:
                 if not manual_report.has_errors:
                     Logger.success(f"Manual validation passed on attempt {manual_attempt}!")
                     break
-                else:
-                    Logger.warning(f"Manual validation failed with {len(manual_report.errors)} errors.")
-                
-                # Setup feedback for the next manual retry
-                feedback = "Manual Validation Errors:\n" + "\n".join(
+
+                Logger.warning(f"Manual validation failed with {len(manual_report.errors)} errors.")
+                # Feedback for the next FORMATTER retry (inner loop only). The
+                # transcript stays the same; we give the formatter its own errors
+                # plus the output it produced so it can fix the formatting.
+                formatter_feedback = "Manual Validation Errors:\n" + "\n".join(
                     f"- [Turn {e.turn_id}]: {e.message}" for e in manual_report.errors
                 )
-                
-                # Pass all previous turns so the generator has full context
-                previous_turns = turns if turns else None
+                previous_output = turns or None
 
-            if manual_report is None:
-                Logger.error("Conversation generation kept failing across all manual retries. Bailing out.")
-                break
+            # If formatting couldn't pass manual validation, the transcript itself
+            # is suspect — regenerate it on the next outer attempt.
+            if manual_report is None or manual_report.has_errors:
+                Logger.error(
+                    "Manual validation did not pass after all formatter retries; "
+                    "regenerating the conversation."
+                )
+                generator_feedback = formatter_feedback or "The formatted conversation failed manual validation."
+                previous_transcript = transcript or None
+                continue
 
-            if manual_report.has_errors:
-                Logger.error("Failed manual validation after all retries. Bailing out.")
-                break
-                
-            Logger.step(f"Stage 3: LLM Agent Validation (Attempt {agent_attempt}/{self.max_agent_attempts})")
+            # ---- Stage 4: LLM agent (content/realism) validation ----
+            Logger.step(f"Stage 4: LLM Agent Validation (agent attempt {agent_attempt}/{self.max_agent_attempts})")
             agent_report = None
             for validation_attempt in range(1, self.max_agent_validation_retries + 1):
                 try:
@@ -291,23 +341,29 @@ class ConversationRunner:
                 break
 
             if agent_report.passed:
-                Logger.success(f"Agent validation passed! (Realism: {agent_report.realism_score}, Match: {agent_report.corpus_match_score})", bold=True)
+                Logger.success(
+                    f"Agent validation passed! (Realism: {agent_report.realism_score}, "
+                    f"Match: {agent_report.corpus_match_score})",
+                    bold=True,
+                )
                 break
-            else:
-                Logger.warning(f"Agent validation failed. Verdict: {agent_report.verdict}")
-            
-            # Setup feedback for the next agent validation retry
-            feedback = "Agent Validation Feedback:\n"
+
+            Logger.warning(f"Agent validation failed. Verdict: {agent_report.verdict}")
+            # Feedback for the next GENERATOR attempt (outer loop): pass the agent's
+            # errors and the previous TRANSCRIPT (not the formatted turns), since the
+            # generator owns the dialogue content the agent validator judged.
+            generator_feedback = "Agent Validation Feedback:\n"
             if agent_report.feedback:
-                feedback += f"{agent_report.feedback}\n"
+                generator_feedback += f"{agent_report.feedback}\n"
             if agent_report.issues:
-                feedback += "\n".join(f"- ({i.severity}) [Turn {i.turn_id}]: {i.description}" for i in agent_report.issues)
-            
-            # Pass all previous turns so the generator has full context
-            previous_turns = turns if turns else None
+                generator_feedback += "\n".join(
+                    f"- ({i.severity}) [Turn {i.turn_id}]: {i.description}" for i in agent_report.issues
+                )
+            previous_transcript = transcript or None
 
         return {
             "topic": topic,
+            "transcript": transcript,
             "turns": turns,
             "manual_validation": manual_report,
             "agent_validation": agent_report,
@@ -320,15 +376,6 @@ class ConversationRunner:
                 and (agent_validation_bypassed or (agent_report and agent_report.passed))
             ),
         }
-
-
-def read_corpus_instances(corpus_path: str) -> pd.DataFrame:
-    """Read the corpus instances from a JSONL file and return as a DataFrame."""
-    if not os.path.exists(corpus_path):
-        raise FileNotFoundError(f"Corpus file not found: {corpus_path}")
-
-    df = pd.read_json(corpus_path, lines=True)
-    return df
 
 
 # Safety cap: give up on an instance after this many *consecutive* generations
@@ -482,8 +529,8 @@ def main() -> None:
     env = os.getenv("ENV", "development").strip().lower()
     is_production = env == "production"
 
-    gemini_llm = GeminiLLM()
-    runner = ConversationRunner(llm=gemini_llm, max_agent_attempts=3, max_manual_attempts=3)
+    krutrim_llm = KrutrimLLM()
+    runner = ConversationRunner(llm=krutrim_llm, max_agent_attempts=3, max_manual_attempts=3)
 
     corpus_path = Path(__file__).resolve().parent / "data" / "corpus_instances.jsonl"
     corpus_df = read_corpus_instances(str(corpus_path))
@@ -502,7 +549,7 @@ def main() -> None:
         indices = range(len(corpus_df))
     else:
         Logger.step("DEVELOPMENT run — generating a single conversation for instance iloc[0] (no upload).")
-        indices = range(1)
+        indices = [234, 0, 135]
         max_conversations = 1
 
     for i in indices:
