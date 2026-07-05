@@ -161,6 +161,7 @@ class ConversationValidatorAgent(BaseAgent):
     """
 
     prompt_name = "conversation-validator-agent"
+    temperature_key = "validator"
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
         super().__init__(llm)
@@ -220,8 +221,8 @@ class ConversationValidatorAgent(BaseAgent):
         if conversation_type:
             system_vars["conversation_type"] = conversation_type
 
-        # Judging should be low-variance / deterministic-ish, not creative.
-        overrides.setdefault("temperature", 0.2)
+        # Temperature comes from settings.AGENT_TEMPERATURES["validator"] (see
+        # BaseAgent.temperature_key); judging wants low-variance values.
         overrides.setdefault("response_format", {"type": "json_object"})
         raw_result = self._generate_json(prompt, system_vars=system_vars, **overrides)
         from ..logger import Logger

@@ -31,7 +31,7 @@ S<n>: [<tag>] -> S<ref>@<ratio> <text> (<Emotion>)
 | `[normal]` | Takes the floor in sequence. | none |
 | `[overlap]` | Both talk at once, neither cut off; both lines full. | ref + ratio (usually `0.0`–`0.2`) |
 | `[interrupt]` | Cuts the previous turn off. | ref, no ratio |
-| `[backchannel]` | Short listener sound (*haan, hmm, achha*) while the other talks; doesn't take the floor. | ref + ratio (`0.0`–`1.0`) |
+| `[backchannel]` | Short listener sound (*haan, hmm, achha*) while the other talks; doesn't take the floor. | ref + ratio (`0.0`–`1.0`) — **place it where the host's words actually trigger the reaction**, not a fixed spot (see below) |
 
 **Interruption rule (most common mistake):** the interrupted line ends with `—`
 and must be a **short, genuinely incomplete fragment** (≈3–8 words), NOT a full
@@ -43,6 +43,7 @@ got to voice.
 
 ```
 S1: [normal] Namaste, main Tech Solutions se. Coding ke liye laptop chahiye aapko? (Neutral)
+S2: [backchannel] -> S1@0.15 haan haan (Neutral)
 S2: [normal] Haan ji paaji, budget bas seventy hazaar tak hai. (Neutral)
 S1: [backchannel] -> S2@0.6 achha (Neutral)
 S1: [normal] Oye, seventy mein badhiya graphics wale— (Happy)
@@ -50,6 +51,10 @@ S2: [interrupt] -> S1 —graphics nahi chahiye ji, sirf coding karni hai. (Neutr
 S1: [normal] Theek hai, phir toh aur sasta pad jaayega. (Happy)
 S2: [overlap] -> S1@0.1 Chak de, wahi toh chahiye tha! (Happy)
 ```
+
+(note the two backchannels above land at different points — `@0.15` right after
+the opening greeting, `@0.6` mid-way through the budget line — because that's
+genuinely where each reaction is triggered, not because of a fixed rule.)
 
 ---
 
@@ -154,7 +159,13 @@ conversation; develop sub-topics rather than drifting to something unrelated.
 
 - **`[backchannel]`** — 8–10+ (≈ one per 2–4 normal turns). Rotate the word (हाँ,
   हम्म, अच्छा, सही है, समझ गया, वाकई?, ओहो, बिल्कुल…); no word more than ~3×.
-  Prefer an accented speaker's own markers as backchannels.
+  Prefer an accented speaker's own markers as backchannels. **Vary `@ratio`
+  across the whole `0.0`–`1.0` range, spread over the conversation** — find the
+  actual word/phrase in the host's line that would provoke the listener's
+  reaction and set the ratio there (an early key fact → `0.1`–`0.3`, a
+  mid-sentence clause → `0.4`–`0.6`, a concluding remark → `0.7`–`0.9`). Never
+  default most backchannels to the same late-ish band just because the host
+  turn is "about to end" — that reads as unnatural.
 - **`[interrupt]`** — at least 2 (truncate the victim).
 - **`[overlap]`** — at least 2 (both lines full, low ratio). Reliable spot: make
   the closing goodbye an overlap (both say thanks/bye at once).
