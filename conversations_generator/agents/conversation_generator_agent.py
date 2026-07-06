@@ -80,22 +80,61 @@ _ACCENT_MARKERS: dict[str, str] = {
 }
 
 
-def _accent_guidance(agent_accent: str | None, user_accent: str | None) -> list[str]:
-    """Build a user-prompt block of concrete markers for any non-Normal accent.
+# For an ENGLISH conversation a regional accent can't be shown with Hindi words
+# (that breaks the English requirement) — it's carried by Indian-English syntax
+# and rhythm instead. Written English doesn't reliably distinguish region, so all
+# non-Normal accents share one Indian-English note here; the content validator
+# grades English accent leniently to match.
+_INDIAN_ENGLISH_ACCENT_NOTE = (
+    "an Indian speaker of English — carry the accent through Indian-English "
+    "rhythm and phrasing that is STILL English: tag questions 'na'/'no?', "
+    "emphasis with 'only'/'itself', 'do one thing', 'what all', and the odd "
+    "naturalised interjection ('arre', 'yaar', 'haan') used sparingly. Do NOT "
+    "insert Hindi words/clauses or Devanagari — that fails the English "
+    "requirement. A light, natural flavour is enough."
+)
 
-    Returns an empty list when neither speaker has a recognized non-Normal accent,
-    so Normal-accent conversations are unaffected.
+
+def _accent_guidance(
+    agent_accent: str | None,
+    user_accent: str | None,
+    language: str | None,
+) -> list[str]:
+    """Build a user-prompt block of concrete accent guidance.
+
+    For Hindi/Hinglish this injects the per-accent Devanagari marker cheat-sheet.
+    For English it injects an Indian-English note instead (Hindi markers would
+    violate the English requirement). Returns an empty list when neither speaker
+    has a recognized non-Normal accent, so Normal-accent conversations are
+    unaffected.
     """
+    is_english = bool(language) and language.strip().lower() == "english"
     entries: list[str] = []
     for who, accent in (("Speaker 1 (agent)", agent_accent), ("Speaker 2 (user)", user_accent)):
         if not accent:
             continue
-        markers = _ACCENT_MARKERS.get(accent.strip().lower())
-        if markers:
-            entries.append(f"- **{who} — {accent}:** {markers}.")
+        if is_english:
+            if accent.strip().lower() == "normal":
+                continue
+            entries.append(f"- **{who} — {accent}:** {_INDIAN_ENGLISH_ACCENT_NOTE}")
+        else:
+            markers = _ACCENT_MARKERS.get(accent.strip().lower())
+            if markers:
+                entries.append(f"- **{who} — {accent}:** {markers}.")
 
     if not entries:
         return []
+
+    if is_english:
+        return [
+            "",
+            "## Accent in English (graded — keep it English)",
+            "The conversation is in English, so a regional accent shows through "
+            "Indian-English phrasing, NOT Hindi words. Give each speaker below a "
+            "little natural Indian-English flavour from their first turns on — a "
+            "couple of markers is plenty. Do NOT code-switch into Hindi.",
+            *entries,
+        ]
 
     return [
         "",
@@ -163,15 +202,18 @@ def _number_directive(include_numbers: bool) -> list[str]:
             "## Numbers (MANDATORY for this conversation)",
             "Weave several CONCRETE numbers naturally into the dialogue — e.g. "
             "prices/amounts, dates, durations, quantities, percentages/discounts, "
-            "measurements, ages, scores, or distances — AND the reasoning around "
-            "them: speakers should state specific figures and then explain, "
-            "justify, compare, or do simple math with them (why a price is high, "
-            "how a discount was calculated, comparing two options, splitting a "
-            "cost, etc.), not just drop a number in isolation. Spell numbers the "
-            "way people actually SAY them aloud in this language (this is spoken "
-            "audio data), not as bare digits where that would sound unnatural. "
-            "Keep it realistic — a few well-motivated numbers across the "
-            "conversation, not a figure crammed into every line.",
+            "measurements, ages, scores, or distances — AND natural reasoning "
+            "around them: speakers state specific figures and then explain, "
+            "justify, or compare them the way people do OUT LOUD (why a price is "
+            "high, whether an option is worth it, weighing two choices), not just "
+            "drop a number in isolation. **Do NOT narrate arithmetic like a "
+            "calculator** — never read out a bare equation such as '45 + 200 = "
+            "245'; a real speaker just says the result ('toh total do sau "
+            "pentaalis ho gaya') and moves on. Spell numbers the way people "
+            "actually SAY them aloud in this language (this is spoken audio data), "
+            "not as bare digits where that would sound unnatural. Keep it "
+            "realistic — a few well-motivated numbers across the conversation, "
+            "not a figure crammed into every line.",
         ]
     return [
         "",
@@ -328,8 +370,8 @@ class ConversationGeneratorAgent(BaseAgent):
                 f"**Gender pair (speaker_1-speaker_2, M=Male, F=Female):** {gender_pair}"
             )
 
-        # Concrete, high-salience markers for any non-Normal accent (no-op otherwise).
-        lines.extend(_accent_guidance(agent_accent, user_accent))
+        # Concrete, high-salience accent guidance (language-aware; no-op for Normal).
+        lines.extend(_accent_guidance(agent_accent, user_accent, language))
 
         if target_duration_sec is not None:
             lines.append("")
@@ -348,9 +390,12 @@ class ConversationGeneratorAgent(BaseAgent):
             lines.append("")
             lines.append("## PREVIOUS ATTEMPT & VALIDATION FEEDBACK")
             lines.append(
-                "Your previous attempt had issues. Read the feedback and write a NEW, "
-                "CORRECTED version of the conversation that fixes them, keeping the "
-                "exact plain-text tag format."
+                "Your previous attempt was REJECTED for the issues below. Do NOT "
+                "resubmit it with cosmetic word-swaps — actually FIX each issue: "
+                "rewrite the flagged lines and any similar ones, replace wording that "
+                "read as robotic or script-like, and add the missing accent/realism "
+                "flavour. Keep the exact plain-text tag format, but the dialogue must "
+                "be visibly different wherever the feedback points."
             )
             lines.append("")
             lines.append("### Feedback / issues to fix:")

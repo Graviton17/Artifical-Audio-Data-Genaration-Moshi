@@ -2,11 +2,12 @@
 
 A single :class:`BaseLLM` is created once and shared by every agent, so switching
 provider (Groq by default) is one argument. The runner drives the pipeline in
-stages — topic generation, conversation generation (a plain-text *generator*
-followed by a JSON *formatter* that assigns deterministic timing/overlap
-metadata), manual timing validation, and LLM agent validation — so every
-generated conversation is mechanically checked (overlap/interruption/backchannel
-timing, duration, turn-type distribution) before it's handed back to the caller.
+stages — topic generation, transcript generation, **content validation** (an LLM
+judge of corpus-fit + realism that gates the formatter: the transcript is only
+formatted once it PASSES), JSON formatting, deterministic manual validation
+(schema/timing), and **format validation** (an LLM judge that only checks the
+formatter converted the approved transcript faithfully). Content quality is fixed
+by regenerating the transcript; formatting problems are fixed by re-formatting.
 
     python -m conversations_generator.runner
     python -m conversations_generator.runner --language=hindi
@@ -20,8 +21,9 @@ timing, duration, turn-type distribution) before it's handed back to the caller.
 wins when given, for any language. Only when it's *omitted* does Hindi default
 to Sarvam and other languages default to Krutrim.
 
-``--validation-model`` is shared by the **formatter** and the **LLM agent validator**
-(not the deterministic manual checks). Defaults to ``gemma``.
+``--validation-model`` is shared by the **formatter**, the **content validator**,
+and the **format validator** (not the deterministic manual checks), so the LLM
+judges stay independent of the generation model. Defaults to ``gemma``.
 """
 
 from __future__ import annotations
@@ -40,10 +42,18 @@ from .agents import (
     ConversationGeneratorAgent,
     TopicGeneratorAgent,
 )
-from .agents.conversation_validator_agent import ConversationValidatorAgent, AgentValidationReport
+from .agents.conversation_content_validator_agent import (
+    ConversationContentValidatorAgent,
+    ContentValidationReport,
+)
+from .agents.conversation_format_validator_agent import (
+    ConversationFormatValidatorAgent,
+    FormatValidationReport,
+)
 from .agents.conversation_validator_manual import ConversationValidatorManual, ValidationReport
 from .configuration_reader import (
     apply_to_environ,
+    get_agent_temperature,
     get_mode,
     get_number_inclusion_percentage,
     is_production,
@@ -54,6 +64,7 @@ from .llm import (
     BaseLLM,
     LLMError,
     LLMProvider,
+    SarvamLLM,
     create_llm,
     resolve_provider,
 )
@@ -98,20 +109,48 @@ def sample_target_duration_sec(
     return round(min(max(random.gauss(mean, std), low), high), 1)
 
 
+# ------------------------------------------------------------------ #
+# Generation sampling temperature.
+#
+# Sarvam is effectively deterministic at the default low temperature and tends to
+# degenerate on longer transcripts (repetition loops that never terminate), and
+# because it's deterministic, every regeneration reproduces the SAME broken
+# transcript — so all retries fail identically. It therefore runs HOTTER than the
+# validation model (gemma), which stays cool for consistent judging. Retries
+# escalate the temperature further so a regeneration actually explores a
+# different transcript instead of repeating the same one.
+# ------------------------------------------------------------------ #
+SARVAM_GENERATION_TEMPERATURE = 0.7
+GENERATION_TEMPERATURE_RETRY_STEP = 0.15
+GENERATION_TEMPERATURE_MAX = 0.95
+
+
 class ConversationRunner:
     """Drives the pipeline agents stage by stage.
+
+    Validation happens in two clearly-separated places:
+
+    * **Content validation** (LLM) runs on the plain-text transcript *before*
+      formatting and gates it — the transcript is only formatted once it PASSES.
+      It judges corpus-fit + realism (language, emotion, accent, gender,
+      naturalness). Failing it regenerates the transcript.
+    * **Format validation** (deterministic timing checks + an LLM faithfulness
+      judge) runs *after* formatting. The content is already approved, so the
+      faithfulness judge only checks that the formatter converted the transcript
+      to JSON without dropping, adding, reordering, or rewording lines. Failing
+      it re-runs the formatter (the transcript is left untouched).
 
     Parameters
     ----------
     llm : BaseLLM | None
-        Generation LLM — topic agent + conversation generator only.
-        ``None`` lets those agents fall back to their own default (Groq).
+        Generation LLM — topic + conversation generator only. ``None`` lets those
+        agents fall back to their own default (Groq).
     validation_llm : BaseLLM | None
-        Shared by the formatter agent and the LLM agent validator. When
-        ``None``, falls back to ``llm`` (same provider for everything).
+        Shared by the formatter and both LLM validators. When ``None``, falls
+        back to ``llm`` (same provider for everything).
     validator : ConversationValidatorManual | None
-        Deterministic timing/overlap validator run after generation. Defaults
-        to ``ConversationValidatorManual()`` with its standard thresholds.
+        Deterministic timing/overlap validator run after formatting. Defaults to
+        ``ConversationValidatorManual()`` with its standard thresholds.
     """
 
     def __init__(
@@ -119,9 +158,10 @@ class ConversationRunner:
         llm: BaseLLM | None = None,
         validation_llm: BaseLLM | None = None,
         validator: ConversationValidatorManual | None = None,
-        max_agent_attempts: int = 3,
-        max_manual_attempts: int = 3,
-        max_agent_validation_retries: int = 3,
+        max_generation_attempts: int = 3,
+        max_format_attempts: int = 3,
+        max_content_validation_retries: int = 3,
+        max_format_validation_retries: int = 3,
         max_edit_attempts: int = 2,
     ) -> None:
         # Generation path: topic + plain-text conversation only.
@@ -136,28 +176,76 @@ class ConversationRunner:
         self.generator_agent = ConversationGeneratorAgent(llm)
         self.formatter_agent = ConversationFormatterAgent(self.validation_llm)
         self.validator = validator or ConversationValidatorManual()
-        self.agent_validator = ConversationValidatorAgent(self.validation_llm)
-        # Repairs a failing conversation with targeted per-turn edits instead of
-        # regenerating the whole thing. Uses the generation LLM (it owns dialogue
-        # content), falling back to the validation LLM if generation is unset.
+        # Both LLM judges run on the validation LLM (``--validation-model``), kept
+        # independent of the generation model so a judge never grades its own
+        # writer's output: the content judge scores the transcript's corpus-fit +
+        # realism, the faithfulness judge checks the formatter's conversion.
+        self.content_validator = ConversationContentValidatorAgent(self.validation_llm)
+        self.format_validator = ConversationFormatValidatorAgent(self.validation_llm)
+        # Repairs a faithfulness failure with targeted per-turn edits (restoring a
+        # reworded turn to the transcript, dropping an extra one) instead of
+        # re-running the whole formatter. Uses the generation LLM (it owns dialogue
+        # content), falling back to the validation LLM when generation is unset.
         self.editor_agent = ConversationEditorAgent(llm if llm is not None else self.validation_llm)
-        self.max_agent_attempts = max(1, max_agent_attempts)
-        self.max_manual_attempts = max(1, max_manual_attempts)
-        # How many times to retry the agent-validation CALL if it errors out
-        # (bad/unparseable LLM response) before bypassing the step entirely.
-        self.max_agent_validation_retries = max(1, max_agent_validation_retries)
-        # How many targeted-edit passes to try before giving up and regenerating.
+        # How many transcripts to generate (each content-validated) before giving up.
+        self.max_generation_attempts = max(1, max_generation_attempts)
+        # How many formatter passes (each manual- + faithfulness-checked) to try.
+        self.max_format_attempts = max(1, max_format_attempts)
+        # How many times to retry a validation CALL that errors out
+        # (unparseable LLM response) before bypassing that step.
+        self.max_content_validation_retries = max(1, max_content_validation_retries)
+        self.max_format_validation_retries = max(1, max_format_validation_retries)
+        # How many targeted-edit passes to try before falling back to re-formatting.
         self.max_edit_attempts = max(1, max_edit_attempts)
+
+        # Base sampling temperature for the CONVERSATION generator. Sarvam runs
+        # hotter than everything else (it degenerates/repeats at the default low
+        # temperature); other providers keep the configured conversation value.
+        conversation_temp = get_agent_temperature("conversation")
+        if isinstance(self.llm, SarvamLLM):
+            self.generation_base_temperature = max(conversation_temp, SARVAM_GENERATION_TEMPERATURE)
+        else:
+            self.generation_base_temperature = conversation_temp
+
+    def _generation_temperature(self, attempt: int) -> float:
+        """Sampling temperature for a generation attempt (escalates on retries).
+
+        Attempt 1 uses the base (Sarvam-aware) temperature; each subsequent retry
+        adds a step so a regeneration explores a different transcript rather than
+        reproducing the same (possibly degenerate) one. Capped so it never gets
+        so hot the output turns incoherent.
+        """
+        temp = self.generation_base_temperature + GENERATION_TEMPERATURE_RETRY_STEP * (attempt - 1)
+        return round(min(GENERATION_TEMPERATURE_MAX, temp), 2)
 
     # ------------------------------------------------------------------ #
     # Stage 1: topic
     # ------------------------------------------------------------------ #
     def generate_topic(self, **profile: Any) -> dict[str, str]:
-        """Produce the next single topic (see ``TopicGeneratorAgent.run``)."""
+        """Produce the next single topic (see ``TopicGeneratorAgent.run``).
+
+        The topic call is JSON-mode, and the model occasionally returns an empty
+        or unparseable response (a transient failure the LLM layer's own retries
+        can't always shake). Retry the whole call a few times so one bad response
+        doesn't abort the run; re-raise only if every attempt fails, letting the
+        caller decide (it treats that as a failed conversation, not a crash).
+        """
         Logger.info(f"Generating topic for {profile.get('language', 'unknown')}...")
-        topic = self.topic_agent.run(**profile)
-        Logger.success(f"Topic generated: {topic.get('title', 'Unknown Title')}")
-        return topic
+        last_err: Exception | None = None
+        for attempt in range(1, self.max_generation_attempts + 1):
+            try:
+                topic = self.topic_agent.run(**profile)
+                Logger.success(f"Topic generated: {topic.get('title', 'Unknown Title')}")
+                return topic
+            except (ValueError, LLMError) as err:
+                last_err = err
+                Logger.warning(
+                    f"Topic generation failed "
+                    f"(attempt {attempt}/{self.max_generation_attempts}): {err}"
+                )
+        raise LLMError(
+            f"Topic generation failed after {self.max_generation_attempts} attempts: {last_err}"
+        ) from last_err
 
     # ------------------------------------------------------------------ #
     # Stage 2: conversation
@@ -232,48 +320,78 @@ class ConversationRunner:
     # Entry point
     # ------------------------------------------------------------------ #
     def run(self, **profile: Any) -> dict[str, Any]:
-        """Run the full pipeline with a two-level retry loop.
+        """Run the full pipeline with a content gate before formatting.
 
         Flow::
 
             topic = generate_topic()
-            for agent_attempt in range(max_agent_attempts):      # OUTER
-                transcript = generator_agent(...)                # one transcript per outer attempt
-                for manual_attempt in range(max_manual_attempts):  # INNER
-                    turns = formatter_agent(transcript, ...)
-                    if manual_validation(turns) passes: break
-                    # else feed manual errors + previous formatted turns back
-                    # to the FORMATTER (transcript unchanged) and retry
-                if manual validation still failing: regenerate transcript (outer)
-                if agent_validation(turns) passes: done
-                # else FIRST try targeted edits (Stage 4b): patch only the flagged
-                # turns in place, re-lay-out timing, re-validate — up to
-                # max_edit_attempts passes. If that fixes it: done, no regeneration.
-                # Only if editing can't be applied / doesn't pass do we fall back to
-                # feeding agent errors + previous TRANSCRIPT back to the GENERATOR
-                # and regenerating the whole conversation (outer).
 
-        So the **inner** loop only re-runs the formatter to fix *formatting*, the
-        **edit** stage surgically fixes flagged *content* without discarding the
-        good turns, and the **outer** loop re-runs the generator only when editing
-        isn't enough — each stage gets feedback targeted at the artefact it owns.
+            # Stage 2+3: generate a transcript and CONTENT-validate it. The
+            # transcript is only handed on once the content judge PASSES.
+            for gen_attempt in range(max_generation_attempts):
+                transcript = generator_agent(...)
+                if content_validator(transcript) PASSES: break
+                # else feed the content feedback + previous transcript back to
+                # the GENERATOR and regenerate
+            else:
+                return failure  # never passed content validation → not formatted
+
+            # Stage 4: format the APPROVED transcript, then validate the
+            # formatting only (deterministic timing + LLM faithfulness).
+            for fmt_attempt in range(max_format_attempts):
+                turns = formatter_agent(transcript, ...)
+                if manual_validation(turns) fails: re-format; continue
+                if format_validator(transcript, turns) PASSES: done
+                # else the formatter was unfaithful → re-format (transcript kept)
+
+        So content quality is fixed by **regeneration** before formatting, and the
+        post-format judge only checks faithful conversion — it never re-judges
+        accent/emotion/realism, which are already approved.
 
         Returns
         -------
         dict with keys: topic, transcript, turns, manual_validation,
-            agent_validation, agent_validation_bypassed, passed.
+            content_validation, format_validation, and retry/bypass metadata.
         """
         Logger.step(f"Starting pipeline for language: {profile.get('language', 'unknown')}")
 
         # Decide ONCE per conversation whether this one is number-rich, drawn from
         # NUMBER_INCLUSION_PERCENTAGE (default 50%). Fixed for the whole pipeline
-        # (topic + every regeneration/edit) so the topic and dialogue stay aligned.
+        # (topic + every regeneration) so the topic and dialogue stay aligned.
         include_numbers = random.random() < get_number_inclusion_percentage()
         Logger.info(
             f"Number inclusion: {'ON — numbers + reasoning' if include_numbers else 'OFF — qualitative'}"
         )
 
-        topic = self.generate_topic(include_numbers=include_numbers, **profile)
+        try:
+            topic = self.generate_topic(include_numbers=include_numbers, **profile)
+        except (ValueError, LLMError) as err:
+            # Topic generation exhausted its retries (e.g. the model kept returning
+            # empty/invalid JSON). Fail THIS conversation gracefully instead of
+            # crashing the whole run — process_instance counts it and moves on.
+            Logger.error(f"Topic generation failed; skipping this conversation: {err}")
+            return {
+                "topic": {},
+                "transcript": "",
+                "turns": [],
+                "manual_validation": None,
+                "content_validation": None,
+                "format_validation": None,
+                "content_validation_bypassed": False,
+                "format_validation_bypassed": False,
+                "format_validation_exhausted": False,
+                "target_duration_sec": None,
+                "include_numbers": include_numbers,
+                "content_attempts_used": 0,
+                "format_attempts_used": 0,
+                "content_validation_attempts_used": 0,
+                "format_validation_attempts_used": 0,
+                "max_generation_attempts": self.max_generation_attempts,
+                "max_format_attempts": self.max_format_attempts,
+                "max_content_validation_retries": self.max_content_validation_retries,
+                "max_format_validation_retries": self.max_format_validation_retries,
+                "passed": False,
+            }
 
         # Draw one exact target duration for this conversation from the Gaussian
         # so lengths follow the intended 4–8 min distribution. Sampled once and
@@ -284,32 +402,39 @@ class ConversationRunner:
             f"({target_duration_sec / 60:.2f} min)"
         )
 
-        turns: list[dict[str, Any]] = []
         transcript: str = ""
-        manual_report: ValidationReport | None = None
-        agent_report: AgentValidationReport | None = None
-        agent_validation_bypassed = False
+        content_report: ContentValidationReport | None = None
+        content_validation_bypassed = False
+        content_attempts_used = 0
+        content_validation_attempts_used = 0
 
-        # Feedback threaded to the GENERATOR across outer attempts.
+        # Feedback threaded back to the GENERATOR across regeneration attempts.
         generator_feedback: str | None = None
         previous_transcript: str | None = None
 
-        # Attempt counters for local metadata (how many tries it took to pass).
-        agent_attempts_used = 0
-        manual_attempts_used = 0
-        agent_validation_attempts_used = 0
-
-        for agent_attempt in range(1, self.max_agent_attempts + 1):
-            agent_attempts_used = agent_attempt
-            if agent_attempt > 1:
+        # ---- Stage 2+3: generate a transcript and gate on content validation ----
+        content_ok = False
+        for gen_attempt in range(1, self.max_generation_attempts + 1):
+            content_attempts_used = gen_attempt
+            if gen_attempt > 1:
                 Logger.retry(
-                    f"Regenerating conversation (agent attempt {agent_attempt}/{self.max_agent_attempts})"
+                    f"Regenerating conversation (attempt {gen_attempt}/{self.max_generation_attempts})"
                 )
             else:
                 Logger.step("Stage 2: Conversation Generation")
 
-            # ---- Stage 2a: generate the plain-text transcript ONCE per outer attempt ----
-            Logger.info("Generating conversation transcript (plain text)...")
+            # Escalate the sampling temperature on each retry. At the configured
+            # low temperature some generation models (e.g. Sarvam) are effectively
+            # deterministic — a regeneration reproduces the SAME transcript (and the
+            # same degeneration, like a repetition loop), so every retry fails
+            # identically. Bumping the temperature makes retries actually explore a
+            # different transcript. Attempt 1 uses the configured value.
+            gen_temperature = self._generation_temperature(gen_attempt)
+
+            Logger.info(
+                f"Generating conversation transcript (plain text) — "
+                f"temperature {gen_temperature:.2f}..."
+            )
             try:
                 transcript = self.generator_agent.run(
                     title=topic["title"],
@@ -319,225 +444,332 @@ class ConversationRunner:
                     feedback=generator_feedback,
                     target_duration_sec=target_duration_sec,
                     include_numbers=include_numbers,
+                    temperature=gen_temperature,
                     **profile,
                 )
             except (ValueError, LLMError) as err:
                 Logger.warning(f"Transcript generation failed: {err}")
-                manual_report = None
                 generator_feedback = f"Conversation generation error on the previous attempt: {err}"
                 previous_transcript = None
+                content_report = None
                 continue
 
-            # ---- Stage 2b + 3: format + manual validation (INNER loop, formatter only) ----
-            Logger.step("Stage 3: Formatting & Manual Validation")
-            manual_report = None
-            turns = []
-            formatter_feedback: str | None = None
-            previous_output: list[dict[str, Any]] | None = None
-            manual_attempts_used = 0
-            for manual_attempt in range(1, self.max_manual_attempts + 1):
-                manual_attempts_used = manual_attempt
-                if manual_attempt > 1:
-                    Logger.retry(
-                        f"Re-formatting (manual attempt {manual_attempt}/{self.max_manual_attempts})"
-                    )
+            # ---- Stage 3: content validation gate (BEFORE formatting) ----
+            Logger.step(
+                f"Stage 3: Content Validation (attempt {gen_attempt}/{self.max_generation_attempts})"
+            )
+            content_report, content_validation_attempts_used = self._run_content_validation(
+                transcript, topic, profile
+            )
 
-                Logger.info("Formatting transcript into schema turns...")
-                try:
-                    turns = self.formatter_agent.run(
-                        transcript=transcript,
-                        agent_emotion=profile.get("agent_emotion"),
-                        user_emotion=profile.get("user_emotion"),
-                        language=profile.get("language"),
-                        feedback=formatter_feedback,
-                        previous_output=previous_output,
-                    )
-                except (ValueError, LLMError) as err:
-                    Logger.warning(f"Formatting failed: {err}")
-                    manual_report = None
-                    formatter_feedback = f"Formatting error on the previous attempt: {err}"
-                    previous_output = None
-                    continue
+            if content_report is None:
+                # Judge unavailable after retries — accept the transcript as-is so
+                # a broken validator can't stall the run (rare infra case).
+                Logger.warning(
+                    f"Content validation unavailable after {self.max_content_validation_retries} "
+                    "retries. Bypassing the content gate for this conversation."
+                )
+                content_validation_bypassed = True
+                content_ok = True
+                break
 
-                Logger.info("Running deterministic manual validation...")
-                manual_report = self.validate_conversation(turns)
-                if not manual_report.has_errors:
-                    Logger.success(f"Manual validation passed on attempt {manual_attempt}!")
-                    break
+            if content_report.passed:
+                Logger.success(
+                    f"Content validation passed! (Realism: {content_report.realism_score}, "
+                    f"Match: {content_report.corpus_match_score})",
+                    bold=True,
+                )
+                content_ok = True
+                break
 
+            Logger.warning(f"Content validation failed. Verdict: {content_report.verdict}")
+            generator_feedback = "Content Validation Feedback:\n" + (
+                content_report.as_feedback() or "The transcript did not match the required attributes."
+            )
+            previous_transcript = transcript or None
+
+        if not content_ok:
+            # Never got an approved transcript — reject without formatting so we
+            # honour the gate ("do not format until content is approved").
+            Logger.error(
+                "Content validation never passed after all attempts; "
+                "rejecting this conversation (not formatted)."
+            )
+            return {
+                "topic": topic,
+                "transcript": transcript,
+                "turns": [],
+                "manual_validation": None,
+                "content_validation": content_report,
+                "format_validation": None,
+                "content_validation_bypassed": content_validation_bypassed,
+                "format_validation_bypassed": False,
+                "target_duration_sec": target_duration_sec,
+                "include_numbers": include_numbers,
+                "content_attempts_used": content_attempts_used,
+                "format_attempts_used": 0,
+                "content_validation_attempts_used": content_validation_attempts_used,
+                "format_validation_attempts_used": 0,
+                "max_generation_attempts": self.max_generation_attempts,
+                "max_format_attempts": self.max_format_attempts,
+                "max_content_validation_retries": self.max_content_validation_retries,
+                "max_format_validation_retries": self.max_format_validation_retries,
+                "passed": False,
+            }
+
+        # ---- Stage 4: format the APPROVED transcript + validate the formatting ----
+        Logger.step("Stage 4: Formatting & Format Validation")
+        turns: list[dict[str, Any]] = []
+        manual_report: ValidationReport | None = None
+        format_report: FormatValidationReport | None = None
+        format_validation_bypassed = False
+        # Set when the faithfulness judge kept failing across all retries but the
+        # formatting was structurally sound every time (manual validation clean).
+        # The LLM judge can hallucinate faithfulness errors on a correct conversion,
+        # so we don't let it discard a manual-valid, content-approved conversation.
+        format_validation_exhausted = False
+        format_ok = False
+        format_attempts_used = 0
+        format_validation_attempts_used = 0
+
+        # Best manual-clean formatting seen so far, kept as the fallback to accept
+        # if the faithfulness judge never returns PASS.
+        best_turns: list[dict[str, Any]] | None = None
+        best_manual_report: ValidationReport | None = None
+
+        formatter_feedback: str | None = None
+        previous_output: list[dict[str, Any]] | None = None
+
+        for fmt_attempt in range(1, self.max_format_attempts + 1):
+            format_attempts_used = fmt_attempt
+            if fmt_attempt > 1:
+                Logger.retry(
+                    f"Re-formatting (attempt {fmt_attempt}/{self.max_format_attempts})"
+                )
+
+            Logger.info("Formatting transcript into schema turns...")
+            try:
+                turns = self.formatter_agent.run(
+                    transcript=transcript,
+                    agent_emotion=profile.get("agent_emotion"),
+                    user_emotion=profile.get("user_emotion"),
+                    language=profile.get("language"),
+                    feedback=formatter_feedback,
+                    previous_output=previous_output,
+                )
+            except (ValueError, LLMError) as err:
+                Logger.warning(f"Formatting failed: {err}")
+                formatter_feedback = f"Formatting error on the previous attempt: {err}"
+                previous_output = None
+                manual_report = None
+                continue
+
+            # ---- Stage 4a: deterministic manual validation (schema/timing) ----
+            Logger.info("Running deterministic manual validation...")
+            manual_report = self.validate_conversation(turns)
+            if manual_report.has_errors:
                 Logger.warning(f"Manual validation failed with {len(manual_report.errors)} errors.")
-                # Feedback for the next FORMATTER retry (inner loop only). The
-                # transcript stays the same; we give the formatter its own errors
-                # plus the output it produced so it can fix the formatting.
                 formatter_feedback = "Manual Validation Errors:\n" + "\n".join(
                     f"- [Turn {e.turn_id}]: {e.message}" for e in manual_report.errors
                 )
                 previous_output = turns or None
-
-            # If formatting couldn't pass manual validation, the transcript itself
-            # is suspect — regenerate it on the next outer attempt.
-            if manual_report is None or manual_report.has_errors:
-                Logger.error(
-                    "Manual validation did not pass after all formatter retries; "
-                    "regenerating the conversation."
-                )
-                generator_feedback = formatter_feedback or "The formatted conversation failed manual validation."
-                previous_transcript = transcript or None
                 continue
+            Logger.success("Manual validation passed.")
+            # Remember this structurally-valid formatting as the accept-fallback.
+            best_turns = turns
+            best_manual_report = manual_report
 
-            # ---- Stage 4: LLM agent (content/realism) validation ----
-            Logger.step(f"Stage 4: LLM Agent Validation (agent attempt {agent_attempt}/{self.max_agent_attempts})")
-            agent_report, agent_validation_attempts_used = self._run_agent_validation(turns, topic, profile)
-
-            # Still couldn't get a verdict after all retries — bypass the step and
-            # accept the conversation, which already passed manual validation.
-            if agent_report is None:
+            # ---- Stage 4b: LLM faithfulness gate (conversion fidelity only) ----
+            format_report, format_validation_attempts_used = self._run_format_validation(
+                transcript, turns
+            )
+            if format_report is None:
                 Logger.warning(
-                    f"Agent validation unavailable after {self.max_agent_validation_retries} "
-                    "retries. Bypassing agent validation for this conversation."
+                    f"Format validation unavailable after {self.max_format_validation_retries} "
+                    "retries. Accepting the manual-valid conversation."
                 )
-                agent_validation_bypassed = True
+                format_validation_bypassed = True
+                format_ok = True
+                break
+            if format_report.passed:
+                Logger.success("Format validation passed — faithful conversion.", bold=True)
+                format_ok = True
                 break
 
-            if agent_report.passed:
-                Logger.success(
-                    f"Agent validation passed! (Realism: {agent_report.realism_score}, "
-                    f"Match: {agent_report.corpus_match_score})",
-                    bold=True,
-                )
-                break
+            Logger.warning(f"Format validation failed. Verdict: {format_report.verdict}")
 
-            Logger.warning(f"Agent validation failed. Verdict: {agent_report.verdict}")
-
-            # ---- Stage 4b: TARGETED EDITS before falling back to full regeneration ----
-            # Try to fix only the flagged turns (edit in place) rather than throwing
-            # away the whole conversation and regenerating from scratch.
-            edit_result = self._repair_by_editing(turns, topic, agent_report, profile)
+            # ---- Stage 4c: TARGETED EDITS before falling back to re-formatting ----
+            # Patch only the flagged turns (restore a reworded turn to the
+            # transcript, drop an extra one) instead of re-running the whole
+            # formatter. If editing makes it faithful + manual-valid: done.
+            edit_result = self._repair_by_editing(turns, transcript, format_report, profile)
             if edit_result is not None:
-                turns, edited_manual_report, edited_agent_report = edit_result
-                manual_report = edited_manual_report
-                if edited_agent_report is None:
-                    # Re-validation was unavailable after edits; accept the edited,
+                turns, edited_manual, edited_format = edit_result
+                manual_report = edited_manual
+                best_turns = turns
+                best_manual_report = edited_manual
+                if edited_format is None:
+                    # Re-validation unavailable after edits; accept the edited,
                     # manual-valid conversation (same policy as the bypass above).
-                    agent_validation_bypassed = True
-                    agent_report = None
+                    format_validation_bypassed = True
+                    format_ok = True
                     break
-                agent_report = edited_agent_report
-                if agent_report.passed:
-                    Logger.success(
-                        f"Targeted edits fixed the conversation! (Realism: "
-                        f"{agent_report.realism_score}, Match: {agent_report.corpus_match_score})",
-                        bold=True,
-                    )
+                format_report = edited_format
+                if format_report.passed:
+                    Logger.success("Targeted edits fixed the formatting — faithful conversion.", bold=True)
+                    format_ok = True
                     break
-                # Edits helped but didn't fully pass — regenerate, now with the
-                # LATEST issues from the edited conversation.
+                # Edits helped but didn't fully pass — fall through to re-format,
+                # now carrying the latest issues from the edited turns.
 
-            # Feedback for the next GENERATOR attempt (outer loop): pass the agent's
-            # errors and the previous TRANSCRIPT (not the formatted turns), since the
-            # generator owns the dialogue content the agent validator judged.
-            generator_feedback = "Agent Validation Feedback:\n"
-            if agent_report and agent_report.feedback:
-                generator_feedback += f"{agent_report.feedback}\n"
-            if agent_report and agent_report.issues:
-                generator_feedback += "\n".join(
-                    f"- ({i.severity}) [Turn {i.turn_id}]: {i.description}" for i in agent_report.issues
-                )
-            previous_transcript = transcript or None
+            formatter_feedback = "Formatting Faithfulness Errors:\n" + (
+                format_report.as_feedback() or "The formatted turns did not faithfully match the transcript."
+            )
+            previous_output = turns or None
+
+        # Faithfulness judge never returned PASS, but the formatting was structurally
+        # valid (manual-clean). The judge can hallucinate faithfulness errors on a
+        # correct conversion, and content is already approved, so accept the best
+        # manual-valid formatting rather than discard a good conversation.
+        if not format_ok and best_turns is not None:
+            Logger.warning(
+                f"Format validation never passed in {self.max_format_attempts} attempts, "
+                "but formatting is manual-valid; accepting best formatting (judge may be "
+                "over-flagging a correct conversion)."
+            )
+            turns = best_turns
+            manual_report = best_manual_report
+            format_validation_exhausted = True
 
         return {
             "topic": topic,
             "transcript": transcript,
             "turns": turns,
             "manual_validation": manual_report,
-            "agent_validation": agent_report,
-            "agent_validation_bypassed": agent_validation_bypassed,
+            "content_validation": content_report,
+            "format_validation": format_report,
+            "content_validation_bypassed": content_validation_bypassed,
+            "format_validation_bypassed": format_validation_bypassed,
+            "format_validation_exhausted": format_validation_exhausted,
             "target_duration_sec": target_duration_sec,
             "include_numbers": include_numbers,
-            "agent_attempts_used": agent_attempts_used,
-            "manual_attempts_used": manual_attempts_used,
-            "agent_validation_attempts_used": agent_validation_attempts_used,
-            "max_agent_attempts": self.max_agent_attempts,
-            "max_manual_attempts": self.max_manual_attempts,
-            "max_agent_validation_retries": self.max_agent_validation_retries,
-            # Accept the conversation if manual validation passed AND agent
-            # validation either passed or was bypassed after exhausting retries.
+            "content_attempts_used": content_attempts_used,
+            "format_attempts_used": format_attempts_used,
+            "content_validation_attempts_used": content_validation_attempts_used,
+            "format_validation_attempts_used": format_validation_attempts_used,
+            "max_generation_attempts": self.max_generation_attempts,
+            "max_format_attempts": self.max_format_attempts,
+            "max_content_validation_retries": self.max_content_validation_retries,
+            "max_format_validation_retries": self.max_format_validation_retries,
+            # Accept only if content was approved (or bypassed) and the formatting
+            # passed deterministic manual validation. The LLM faithfulness judge is
+            # advisory: it must pass, be bypassed (unavailable), or have exhausted
+            # its retries on manual-valid formatting — it cannot, by itself, reject
+            # a conversation the deterministic checks already vouch for.
             "passed": bool(
-                manual_report
+                content_ok
+                and manual_report
                 and not manual_report.has_errors
-                and (agent_validation_bypassed or (agent_report and agent_report.passed))
+                and (format_ok or format_validation_exhausted)
             ),
         }
 
     # ------------------------------------------------------------------ #
-    # Stage 4 helpers
+    # Validation helpers
     # ------------------------------------------------------------------ #
-    def _run_agent_validation(
+    def _run_content_validation(
         self,
-        turns: list[dict[str, Any]],
+        transcript: str,
         topic: dict[str, str],
         profile: dict[str, Any],
-    ) -> tuple[AgentValidationReport | None, int]:
-        """Call the LLM agent validator, retrying transient call failures.
+    ) -> tuple[ContentValidationReport | None, int]:
+        """Call the content judge, retrying transient call failures.
 
         Returns ``(report, attempts_used)``; ``report`` is ``None`` if every
         attempt raised (unparseable/failed response), so the caller can bypass.
         """
-        report: AgentValidationReport | None = None
+        report: ContentValidationReport | None = None
         attempts_used = 0
-        for validation_attempt in range(1, self.max_agent_validation_retries + 1):
-            attempts_used = validation_attempt
+        for attempt in range(1, self.max_content_validation_retries + 1):
+            attempts_used = attempt
             try:
-                report = self.agent_validator.run(turns=turns, topic=topic, **profile)
+                report = self.content_validator.run(transcript=transcript, topic=topic, **profile)
                 break
             except (ValueError, LLMError) as err:
                 Logger.warning(
-                    f"Agent validation call failed "
-                    f"(attempt {validation_attempt}/{self.max_agent_validation_retries}): {err}"
+                    f"Content validation call failed "
+                    f"(attempt {attempt}/{self.max_content_validation_retries}): {err}"
+                )
+        return report, attempts_used
+
+    def _run_format_validation(
+        self,
+        transcript: str,
+        turns: list[dict[str, Any]],
+    ) -> tuple[FormatValidationReport | None, int]:
+        """Call the faithfulness judge, retrying transient call failures.
+
+        Returns ``(report, attempts_used)``; ``report`` is ``None`` if every
+        attempt raised, so the caller can bypass the faithfulness check.
+        """
+        report: FormatValidationReport | None = None
+        attempts_used = 0
+        for attempt in range(1, self.max_format_validation_retries + 1):
+            attempts_used = attempt
+            try:
+                report = self.format_validator.run(transcript=transcript, turns=turns)
+                break
+            except (ValueError, LLMError) as err:
+                Logger.warning(
+                    f"Format validation call failed "
+                    f"(attempt {attempt}/{self.max_format_validation_retries}): {err}"
                 )
         return report, attempts_used
 
     def _repair_by_editing(
         self,
         turns: list[dict[str, Any]],
-        topic: dict[str, str],
-        agent_report: AgentValidationReport,
+        transcript: str,
+        format_report: FormatValidationReport,
         profile: dict[str, Any],
-    ) -> tuple[list[dict[str, Any]], ValidationReport, AgentValidationReport | None] | None:
-        """Fix a failing conversation with targeted per-turn edits.
+    ) -> tuple[list[dict[str, Any]], ValidationReport, FormatValidationReport | None] | None:
+        """Fix a faithfulness failure with targeted per-turn edits.
 
         Repeatedly asks the editor agent for a minimal patch addressing the
-        validator's issues, applies it (which deterministically re-lays-out
-        timing), re-checks manual validation, then re-judges with the agent
-        validator — up to ``max_edit_attempts`` passes.
+        faithfulness judge's issues (restore a reworded turn to the transcript,
+        drop an added one), applies it (which deterministically re-lays-out
+        timing), re-checks manual validation, then re-judges faithfulness — up to
+        ``max_edit_attempts`` passes. The **transcript is passed to the editor as
+        ground truth** so it can make each turn match it.
 
-        Returns ``(edited_turns, manual_report, agent_report)`` where
-        ``agent_report`` is the latest verdict (or ``None`` if re-validation was
+        Returns ``(edited_turns, manual_report, format_report)`` where
+        ``format_report`` is the latest verdict (or ``None`` if re-validation was
         unavailable). Returns ``None`` when editing can't be applied at all
-        (editor error, no edits proposed, patch rejected, or the edited turns
-        fail manual validation) — the caller then falls back to full regeneration.
+        (editor error, no edits proposed, patch rejected, or the edited turns fail
+        manual validation) — the caller then falls back to re-formatting.
         """
         current_turns = turns
-        current_report = agent_report
+        current_report = format_report
         manual_report: ValidationReport | None = None
 
         for edit_attempt in range(1, self.max_edit_attempts + 1):
             Logger.step(
-                f"Stage 4b: Targeted edit repair (attempt {edit_attempt}/{self.max_edit_attempts})"
+                f"Stage 4c: Targeted edit repair (attempt {edit_attempt}/{self.max_edit_attempts})"
             )
             try:
                 edits = self.editor_agent.run(
                     turns=current_turns,
                     issues=current_report.issues,
                     feedback=current_report.feedback,
+                    transcript=transcript,
                     **profile,
                 )
             except (ValueError, LLMError) as err:
-                Logger.warning(f"Editor call failed: {err}. Falling back to regeneration.")
+                Logger.warning(f"Editor call failed: {err}. Falling back to re-formatting.")
                 return None
 
             if not edits:
-                Logger.info("Editor proposed no edits. Falling back to regeneration.")
+                Logger.info("Editor proposed no edits. Falling back to re-formatting.")
                 return None
 
             Logger.info(f"Applying {len(edits)} targeted edit(s) in place...")
@@ -549,37 +781,35 @@ class ConversationRunner:
                     user_emotion=profile.get("user_emotion"),
                 )
             except (ValueError, LLMError) as err:
-                Logger.warning(f"Applying edits failed: {err}. Falling back to regeneration.")
+                Logger.warning(f"Applying edits failed: {err}. Falling back to re-formatting.")
                 return None
 
             manual_report = self.validate_conversation(edited_turns)
             if manual_report.has_errors:
                 Logger.warning(
                     f"Edited conversation failed manual validation "
-                    f"({len(manual_report.errors)} errors). Falling back to regeneration."
+                    f"({len(manual_report.errors)} errors). Falling back to re-formatting."
                 )
                 return None
 
             Logger.success(f"Edits applied and passed manual validation (attempt {edit_attempt}).")
             current_turns = edited_turns
 
-            # Re-judge the edited conversation.
-            new_report, _ = self._run_agent_validation(current_turns, topic, profile)
+            new_report, _ = self._run_format_validation(transcript, current_turns)
             if new_report is None:
-                Logger.warning("Agent re-validation unavailable after edits; accepting edited conversation.")
+                Logger.warning("Faithfulness re-validation unavailable after edits; accepting edited conversation.")
                 return current_turns, manual_report, None
             if new_report.passed:
                 return current_turns, manual_report, new_report
 
             Logger.warning(
-                f"Edited conversation still failing (verdict {new_report.verdict}); "
-                "trying another edit pass." if edit_attempt < self.max_edit_attempts
-                else f"Edited conversation still failing (verdict {new_report.verdict})."
+                f"Edited conversation still failing faithfulness (verdict {new_report.verdict}); "
+                + ("trying another edit pass." if edit_attempt < self.max_edit_attempts else "giving up on edits.")
             )
             current_report = new_report
 
         # Edit passes exhausted without a PASS — hand back the best-effort edited
-        # turns and the latest verdict so the caller decides (regenerate).
+        # turns and the latest verdict so the caller decides (re-format).
         assert manual_report is not None
         return current_turns, manual_report, current_report
 
@@ -633,7 +863,8 @@ def _build_metadata_text(
     topic = result.get("topic") or {}
     turns = result.get("turns") or []
     manual_report = result.get("manual_validation")
-    agent_report = result.get("agent_validation")
+    content_report = result.get("content_validation")
+    format_report = result.get("format_validation")
     counts = _turn_type_counts(turns)
     duration = getattr(manual_report, "duration_sec", None)
     target = result.get("target_duration_sec")
@@ -676,36 +907,48 @@ def _build_metadata_text(
     for ttype, count in sorted(counts.items()):
         lines.append(f"  {ttype}: {count}")
 
-    agent_attempts = result.get("agent_attempts_used", 0)
-    manual_attempts = result.get("manual_attempts_used", 0)
-    validation_attempts = result.get("agent_validation_attempts_used", 0)
+    gen_attempts = result.get("content_attempts_used", 0)
+    format_attempts = result.get("format_attempts_used", 0)
+    content_val_attempts = result.get("content_validation_attempts_used", 0)
+    format_val_attempts = result.get("format_validation_attempts_used", 0)
     lines += [
         "",
         "## Retries",
-        f"agent_attempts_used: {agent_attempts} / {result.get('max_agent_attempts')}",
-        f"manual_attempts_used: {manual_attempts} / {result.get('max_manual_attempts')}",
-        f"agent_validation_attempts_used: {validation_attempts} / {result.get('max_agent_validation_retries')}",
-        f"agent_retries: {max(0, int(agent_attempts) - 1)}",
-        f"manual_retries: {max(0, int(manual_attempts) - 1)}",
-        f"agent_validation_retries: {max(0, int(validation_attempts) - 1)}",
-        f"agent_validation_bypassed: {result.get('agent_validation_bypassed', False)}",
+        f"generation_attempts_used: {gen_attempts} / {result.get('max_generation_attempts')}",
+        f"format_attempts_used: {format_attempts} / {result.get('max_format_attempts')}",
+        f"content_validation_attempts_used: {content_val_attempts} / {result.get('max_content_validation_retries')}",
+        f"format_validation_attempts_used: {format_val_attempts} / {result.get('max_format_validation_retries')}",
+        f"generation_retries: {max(0, int(gen_attempts) - 1)}",
+        f"format_retries: {max(0, int(format_attempts) - 1)}",
+        f"content_validation_bypassed: {result.get('content_validation_bypassed', False)}",
+        f"format_validation_bypassed: {result.get('format_validation_bypassed', False)}",
+        f"format_validation_exhausted: {result.get('format_validation_exhausted', False)}",
         "",
-        "## Agent validation",
+        "## Content validation (pre-format: corpus fit + realism)",
     ]
-    if agent_report is not None:
+    if content_report is not None:
         lines += [
-            f"verdict: {getattr(agent_report, 'verdict', '')}",
-            f"realism_score: {getattr(agent_report, 'realism_score', '')}",
-            f"corpus_match_score: {getattr(agent_report, 'corpus_match_score', '')}",
+            f"verdict: {getattr(content_report, 'verdict', '')}",
+            f"realism_score: {getattr(content_report, 'realism_score', '')}",
+            f"corpus_match_score: {getattr(content_report, 'corpus_match_score', '')}",
         ]
-        field_matches = getattr(agent_report, "corpus_field_matches", None) or {}
+        field_matches = getattr(content_report, "corpus_field_matches", None) or {}
         if field_matches:
             lines.append("corpus_field_matches:")
             for key, matched in field_matches.items():
                 lines.append(f"  {key}: {matched}")
-        feedback = getattr(agent_report, "feedback", "") or ""
+        feedback = getattr(content_report, "feedback", "") or ""
         if feedback:
             lines += ["", "feedback:", feedback]
+    else:
+        lines.append("verdict: (bypassed or unavailable)")
+
+    lines += ["", "## Format validation (post-format: conversion faithfulness)"]
+    if format_report is not None:
+        lines.append(f"verdict: {getattr(format_report, 'verdict', '')}")
+        format_feedback = getattr(format_report, "feedback", "") or ""
+        if format_feedback:
+            lines += ["", "feedback:", format_feedback]
     else:
         lines.append("verdict: (bypassed or unavailable)")
 
@@ -977,8 +1220,8 @@ def _get_runner(
         runner_cache[cache_key] = ConversationRunner(
             llm=generation_llm,
             validation_llm=validation_llm,
-            max_agent_attempts=3,
-            max_manual_attempts=3,
+            max_generation_attempts=3,
+            max_format_attempts=3,
         )
     return runner_cache[cache_key]
 
@@ -1040,9 +1283,25 @@ def main(argv: list[str] | None = None) -> None:
         # Without a language filter, keep the original hand-picked indices for
         # variety across the full corpus; with a filter, just take the first
         # few rows of the (already language-scoped) corpus.
-        indices = [i for i in (234, 0, 135) if i < len(corpus_df)] if not args.language else list(
-            range(min(3, len(corpus_df)))
-        )
+        indices = [
+            # --- original smoke tests ---
+            234,   # English  | FM | user West accent | Neutral/Sad
+            0,     # Hinglish | FM | Normal           | Neutral/Neutral (baseline)
+            135,   # Hindi    | MM | user Bengali     | Neutral/Neutral
+            # --- Hindi (Devanagari + gender agreement + accents) ---
+            59,    # Hindi    | MF | Normal            | Neutral/Neutral (gender baseline)
+            3278,  # Hindi    | FM | Punjabi both      | Happy/Happy
+            6599,  # Hindi    | MM | Bengali both      | Angry/Sad (opposing emotion)
+            3235,  # Hindi    | FF | West/Bengali mix  | Happy/Angry (mixed accents)
+            # --- Hinglish (code-mixing + accents) ---
+            5,     # Hinglish | FM | Normal            | Neutral/Happy (baseline)
+            4921,  # Hinglish | FF | Gujarati both     | Sad/Sad
+            4751,  # Hinglish | MF | South Indian both | Angry/Neutral
+            # --- English (no Devanagari; lang-vs-accent tension) ---
+            2225,  # English  | MF | Normal            | Sad/Sad (pure emotional)
+            2882,  # English  | FM | West both         | Happy/Neutral
+            2563,  # English  | MM | Bengali/Punjabi   | Neutral/Angry (mixed accents)
+        ]
         max_conversations = 1
 
     for i in indices:

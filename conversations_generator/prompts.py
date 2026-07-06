@@ -33,7 +33,8 @@ _LOCAL_PROMPT_FILES: dict[str, str] = {
     "topic-generator-agent": "topic-generator-prompt.md",
     "conversation-generator-agent": "conversation-generator-agent.md",
     "conversation-formatter-agent": "conversation-formatter-agent.md",
-    "conversation-validator-agent": "conversation-validator-agent.md",
+    "conversation-content-validator-agent": "conversation-content-validator-agent.md",
+    "conversation-format-validator-agent": "conversation-format-validator-agent.md",
 }
 
 # Retry policy for the (network) Langfuse fetch before falling back to local.

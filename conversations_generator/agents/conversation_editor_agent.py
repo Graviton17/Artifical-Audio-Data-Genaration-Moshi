@@ -1,11 +1,22 @@
 """Agent that repairs a conversation with *targeted edits* instead of a full rewrite.
 
-When the LLM agent validator
-(:class:`~conversations_generator.agents.conversation_validator_agent.ConversationValidatorAgent`)
-fails a conversation, the default repair is to regenerate the whole transcript —
-throwing away all the turns that were fine. This agent offers a cheaper path: it
-reads the validator's specific issues (each usually tied to a ``turn_id``) and
-emits a small **patch** touching only the affected turns, e.g.:
+.. note::
+   This agent runs in the **faithfulness-repair** path (Stage 4c). Content quality
+   is validated on the plain-text transcript *before* formatting
+   (:class:`~conversations_generator.agents.conversation_content_validator_agent.ConversationContentValidatorAgent`)
+   and fixed by regenerating the transcript. After formatting, the format validator
+   (:class:`~conversations_generator.agents.conversation_format_validator_agent.ConversationFormatValidatorAgent`)
+   checks conversion faithfulness only; when it flags turns whose text drifted from
+   the transcript,
+   :meth:`~conversations_generator.runner.ConversationRunner._repair_by_editing`
+   calls this editor to patch just those turns — restoring each to its ground-truth
+   transcript line, or deleting a turn the transcript has no line for — before the
+   runner falls back to a full re-format. It does **not** repair content/realism
+   issues (those are handled upstream by regeneration).
+
+Given a conversation and a list of specific validator issues (each usually tied
+to a ``turn_id``), it emits a small **patch** touching only the affected turns,
+e.g.:
 
     {"edits": [
       {"turn_id": "t36", "action": "replace",
@@ -65,6 +76,11 @@ Hard rules:
   turns.
 - Never invent new turns. You may only REPLACE the text/emotion/turn_type of an
   existing turn, or DELETE an existing turn.
+- When a GROUND-TRUTH transcript is provided, it is the single source of truth.
+  Your ONLY job is to make each turn's text match its transcript line verbatim
+  (restoring a reworded turn) or DELETE a turn the transcript has no line for. Do
+  NOT "fix" content, wording, accent, emotion, or realism beyond that — those were
+  already approved on the transcript; changing them re-breaks faithfulness.
 - Keep the SAME language, script, and register as the surrounding dialogue
   (Hindi in Devanagari, Hinglish in Roman, English in English — match what the
   turn already uses).
@@ -119,7 +135,8 @@ class ConversationEditorAgent(BaseAgent):
         user_emotion: str | None = None,
         agent_accent: str | None = None,
         user_accent: str | None = None,
-        conversation_type: str | None = None,  # accepted from profile; not needed here
+        conversation_type: str | None = None,  # tolerated if passed; not used here
+        transcript: str | None = None,
         **overrides: Any,
     ) -> list[dict[str, Any]]:
         """Return a list of edit dicts fixing the flagged ``issues``.
@@ -135,6 +152,10 @@ class ConversationEditorAgent(BaseAgent):
             The validator's free-text feedback / regeneration guidance.
         language, gender_pair, agent_emotion, user_emotion, agent_accent, user_accent :
             Corpus-instance constraints, so edits stay consistent with them.
+        transcript : str | None
+            The source plain-text transcript. When given (faithfulness repair), it
+            is the GROUND TRUTH each turn's text must match — the editor restores a
+            reworded turn to its transcript line and deletes any turn not in it.
 
         Returns
         -------
@@ -152,6 +173,7 @@ class ConversationEditorAgent(BaseAgent):
             user_emotion=user_emotion,
             agent_accent=agent_accent,
             user_accent=user_accent,
+            transcript=transcript,
         )
 
         overrides.setdefault("response_format", {"type": "json_object"})
@@ -178,6 +200,7 @@ class ConversationEditorAgent(BaseAgent):
         user_emotion: str | None,
         agent_accent: str | None,
         user_accent: str | None,
+        transcript: str | None = None,
     ) -> str:
         lines: list[str] = [
             "Fix the specific issues listed below by editing ONLY the affected "
@@ -196,6 +219,18 @@ class ConversationEditorAgent(BaseAgent):
             lines.append(f"- speaker_1 (agent) accent: {agent_accent}")
         if user_accent:
             lines.append(f"- speaker_2 (user) accent: {user_accent}")
+
+        if transcript:
+            lines += [
+                "",
+                "## GROUND-TRUTH transcript (each turn's text MUST match its line here)",
+                "The issues below are faithfulness errors: a turn's text was reworded, "
+                "or an extra turn was added, versus this transcript. `replace` a "
+                "reworded turn's text with its exact line below (verbatim, keep any "
+                "trailing em-dash), and `delete` any turn that has no matching line. "
+                "Do NOT change turns that already match.",
+                transcript,
+            ]
 
         lines += ["", "## Issues to fix"]
         for issue in issues:
