@@ -2,14 +2,14 @@
 
 Uses the ``openai`` SDK (``pip install openai``), which exposes the native
 chat-completions API. The API key is read from the ``api_key`` argument or
-the ``OPENAI_API_KEY`` environment variable.
+``OPENAI_API_KEY`` in ``conversations_generator/config.json``.
 """
 
 from __future__ import annotations
 
-import os
-from typing import Any
+from typing import Any, Iterator
 
+from ..configuration_reader import get as config_get
 from .base_llm import BaseLLM, LLMError, LLMResponse, Message
 
 try:
@@ -26,7 +26,7 @@ class OpenAILLM(BaseLLM):
         model: str = "gpt-4.1",
         *,
         api_key: str | None = None,
-        temperature: float = 0.7,
+        temperature: float = 0.3,
         max_tokens: int | None = None,
         max_retries: int = 3,
         retry_backoff: float = 2.0,
@@ -40,9 +40,12 @@ class OpenAILLM(BaseLLM):
             max_retries=max_retries,
             retry_backoff=retry_backoff,
         )
-        key = api_key or os.getenv("OPENAI_API_KEY")
+        key = api_key or config_get("OPENAI_API_KEY")
         if not key:
-            raise LLMError("No OpenAI API key found. Pass api_key= or set OPENAI_API_KEY.")
+            raise LLMError(
+                "No OpenAI API key found. Pass api_key= or set OPENAI_API_KEY "
+                "in conversations_generator/config.json."
+            )
         self._client = OpenAI(api_key=key)
 
     def _complete(self, messages: list[Message], **overrides: Any) -> LLMResponse:
@@ -68,6 +71,25 @@ class OpenAILLM(BaseLLM):
             usage=self._usage(response),
             raw=response,
         )
+
+    def _complete_stream(self, messages: list[Message], **overrides: Any) -> Iterator[str]:
+        params = self._resolved(overrides)
+
+        kwargs: dict[str, Any] = {
+            "model": self.model,
+            "messages": messages,
+            "temperature": params["temperature"],
+            "stream": True,
+        }
+        if params["max_tokens"] is not None:
+            kwargs["max_tokens"] = params["max_tokens"]
+        if overrides.get("response_format"):
+            kwargs["response_format"] = overrides["response_format"]
+
+        for event in self._client.chat.completions.create(**kwargs):
+            delta = event.choices[0].delta.content if event.choices else None
+            if delta:
+                yield delta
 
     @staticmethod
     def _usage(response: Any) -> dict[str, int]:

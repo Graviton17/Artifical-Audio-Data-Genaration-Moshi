@@ -9,6 +9,7 @@ Layout contract every backend must honor::
 
     <bucket root>/
         checkpoint.json                     # resume state (root level)
+        skipped.json                         # instances abandoned after N failures
         instance_<id>/                       # one folder per corpus instance
             conversation_0001.json
             conversation_0002.json
@@ -21,6 +22,7 @@ from abc import ABC, abstractmethod
 from typing import Any
 
 from .checkpoint import Checkpoint
+from .skipped import SkippedRegistry
 
 
 class StorageError(RuntimeError):
@@ -32,6 +34,9 @@ class BaseStorage(ABC):
 
     #: File name of the resume state at the bucket root.
     CHECKPOINT_NAME = "checkpoint.json"
+
+    #: File name of the abandoned-instance registry at the bucket root.
+    SKIPPED_NAME = "skipped.json"
 
     @staticmethod
     def instance_folder(corpus_combination_id: int) -> str:
@@ -67,4 +72,14 @@ class BaseStorage(ABC):
     @abstractmethod
     def save_checkpoint(self, checkpoint: Checkpoint) -> None:
         """Write the root ``checkpoint.json`` (overwriting any prior state)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def load_skipped(self) -> SkippedRegistry:
+        """Read the root ``skipped.json``; return an empty registry if absent."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def save_skipped(self, skipped: SkippedRegistry) -> None:
+        """Write the root ``skipped.json`` (overwriting any prior state)."""
         raise NotImplementedError

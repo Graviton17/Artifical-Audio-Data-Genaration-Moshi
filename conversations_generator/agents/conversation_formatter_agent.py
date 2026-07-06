@@ -125,6 +125,7 @@ class ConversationFormatterAgent(BaseAgent):
     """
 
     prompt_name = "conversation-formatter-agent"
+    temperature_key = "formatter"
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
         super().__init__(llm)
@@ -173,10 +174,15 @@ class ConversationFormatterAgent(BaseAgent):
 
         prompt = self._build_prompt(transcript, feedback=feedback, previous_output=previous_output)
 
-        # Parsing should be near-deterministic, not creative.
-        overrides.setdefault("temperature", 0.1)
+        # Temperature comes from config.json's AGENT_TEMPERATURES["formatter"]
+        # (see BaseAgent.temperature_key); parsing wants low/deterministic values.
         overrides.setdefault("response_format", {"type": "json_object"})
-        raw_result = self._generate_json(prompt, **overrides)
+        raw_result = self._generate_json(
+            prompt,
+            stream=True,
+            stream_label="Formatting transcript into schema turns…",
+            **overrides,
+        )
 
         from ..logger import Logger
         Logger.debug(f"Formatter LLM Output:\n{json.dumps(raw_result, indent=2, ensure_ascii=False)}")
@@ -184,6 +190,101 @@ class ConversationFormatterAgent(BaseAgent):
         parsed = self._extract_lines(raw_result)
         turns = self._assemble(parsed, agent_emotion=agent_emotion, user_emotion=user_emotion)
         return turns
+
+    # ------------------------------------------------------------------ #
+    # Targeted editing (repair specific turns without full regeneration)
+    # ------------------------------------------------------------------ #
+    def apply_edits(
+        self,
+        turns: list[dict[str, Any]],
+        edits: list[dict[str, Any]],
+        *,
+        agent_emotion: str | None = None,
+        user_emotion: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Apply per-turn edits to already-formatted turns, then re-lay-out timing.
+
+        ``edits`` is a list of ``{"turn_id", "action", ...}`` patches produced by
+        :class:`~conversations_generator.agents.conversation_editor_agent.ConversationEditorAgent`:
+
+        * ``action="replace"`` — update ``text`` (and optionally ``emotion`` /
+          ``turn_type``) of the turn with that ``turn_id``.
+        * ``action="delete"`` — drop that turn entirely (e.g. an excess backchannel).
+
+        Only the referenced turns change; everything else is preserved verbatim.
+        The edited turns are then run back through the same deterministic
+        :meth:`_assemble` used for fresh formatting, so ``turn_id``s, relational
+        references (``overlaps_with`` / ``interrupted_by``), and all timing are
+        rebuilt consistently — the returned turns pass manual validation by
+        construction, exactly like freshly-formatted ones.
+        """
+        by_id = {str(t.get("turn_id")): dict(t) for t in turns}
+        deleted: set[str] = set()
+
+        for edit in edits or []:
+            if not isinstance(edit, dict):
+                continue
+            tid = str(edit.get("turn_id", "")).strip()
+            action = str(edit.get("action", "replace")).strip().lower()
+            if tid not in by_id:
+                continue  # unknown turn id — ignore rather than guess
+            if action == "delete":
+                deleted.add(tid)
+                continue
+            target = by_id[tid]
+            if "text" in edit and str(edit.get("text", "")).strip():
+                target["text"] = str(edit["text"]).strip()
+            new_emotion = str(edit.get("emotion", "")).strip().capitalize()
+            if new_emotion in VALID_EMOTIONS:
+                target["emotion"] = new_emotion
+            new_type = _TURN_TYPE_ALIASES.get(str(edit.get("turn_type", "")).strip().lower())
+            if new_type:
+                target["turn_type"] = new_type
+
+        # Preserve original order, minus deletions.
+        ordered = [by_id[str(t.get("turn_id"))] for t in turns if str(t.get("turn_id")) not in deleted]
+        if not ordered:
+            raise ValueError("Edits would remove every turn; refusing to apply.")
+
+        parsed = self._turns_to_parsed(ordered)
+        return self._assemble(parsed, agent_emotion=agent_emotion, user_emotion=user_emotion)
+
+    @staticmethod
+    def _turns_to_parsed(turns: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Reduce full schema turns back to the ``_assemble`` input shape.
+
+        Recovers the two hints ``_assemble`` needs but the output schema doesn't
+        store: ``ref_speaker`` (the partner's speaker, from ``overlaps_with``) and
+        ``ref_ratio`` (where inside the partner span this turn began, reconstructed
+        from the existing ``planned_*`` times), so re-assembly reproduces the same
+        overlap/backchannel placement rather than falling back to fixed offsets.
+        """
+        by_id = {str(t.get("turn_id")): t for t in turns}
+        parsed: list[dict[str, Any]] = []
+        for t in turns:
+            turn_type = t.get("turn_type", "Normal")
+            ref_speaker = None
+            ref_ratio = None
+            partner = by_id.get(str(t.get("overlaps_with"))) if t.get("overlaps_with") else None
+            if partner is not None and turn_type in {"Overlapping", "Backchanneling", "Interruption"}:
+                ref_speaker = partner.get("speaker")
+                if turn_type in {"Overlapping", "Backchanneling"}:
+                    p_s = partner.get("planned_start_sec")
+                    p_e = partner.get("planned_end_sec")
+                    t_s = t.get("planned_start_sec")
+                    if None not in (p_s, p_e, t_s) and p_e > p_s:
+                        ref_ratio = max(0.0, min(1.0, (t_s - p_s) / (p_e - p_s)))
+            parsed.append(
+                {
+                    "speaker": t.get("speaker", "speaker_1"),
+                    "turn_type": turn_type,
+                    "ref_speaker": ref_speaker,
+                    "ref_ratio": ref_ratio,
+                    "emotion": t.get("emotion"),
+                    "text": str(t.get("text", "")).strip(),
+                }
+            )
+        return parsed
 
     # ------------------------------------------------------------------ #
     # Prompt construction

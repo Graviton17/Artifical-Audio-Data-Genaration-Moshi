@@ -80,22 +80,61 @@ _ACCENT_MARKERS: dict[str, str] = {
 }
 
 
-def _accent_guidance(agent_accent: str | None, user_accent: str | None) -> list[str]:
-    """Build a user-prompt block of concrete markers for any non-Normal accent.
+# For an ENGLISH conversation a regional accent can't be shown with Hindi words
+# (that breaks the English requirement) — it's carried by Indian-English syntax
+# and rhythm instead. Written English doesn't reliably distinguish region, so all
+# non-Normal accents share one Indian-English note here; the content validator
+# grades English accent leniently to match.
+_INDIAN_ENGLISH_ACCENT_NOTE = (
+    "an Indian speaker of English — carry the accent through Indian-English "
+    "rhythm and phrasing that is STILL English: tag questions 'na'/'no?', "
+    "emphasis with 'only'/'itself', 'do one thing', 'what all', and the odd "
+    "naturalised interjection ('arre', 'yaar', 'haan') used sparingly. Do NOT "
+    "insert Hindi words/clauses or Devanagari — that fails the English "
+    "requirement. A light, natural flavour is enough."
+)
 
-    Returns an empty list when neither speaker has a recognized non-Normal accent,
-    so Normal-accent conversations are unaffected.
+
+def _accent_guidance(
+    agent_accent: str | None,
+    user_accent: str | None,
+    language: str | None,
+) -> list[str]:
+    """Build a user-prompt block of concrete accent guidance.
+
+    For Hindi/Hinglish this injects the per-accent Devanagari marker cheat-sheet.
+    For English it injects an Indian-English note instead (Hindi markers would
+    violate the English requirement). Returns an empty list when neither speaker
+    has a recognized non-Normal accent, so Normal-accent conversations are
+    unaffected.
     """
+    is_english = bool(language) and language.strip().lower() == "english"
     entries: list[str] = []
     for who, accent in (("Speaker 1 (agent)", agent_accent), ("Speaker 2 (user)", user_accent)):
         if not accent:
             continue
-        markers = _ACCENT_MARKERS.get(accent.strip().lower())
-        if markers:
-            entries.append(f"- **{who} — {accent}:** {markers}.")
+        if is_english:
+            if accent.strip().lower() == "normal":
+                continue
+            entries.append(f"- **{who} — {accent}:** {_INDIAN_ENGLISH_ACCENT_NOTE}")
+        else:
+            markers = _ACCENT_MARKERS.get(accent.strip().lower())
+            if markers:
+                entries.append(f"- **{who} — {accent}:** {markers}.")
 
     if not entries:
         return []
+
+    if is_english:
+        return [
+            "",
+            "## Accent in English (graded — keep it English)",
+            "The conversation is in English, so a regional accent shows through "
+            "Indian-English phrasing, NOT Hindi words. Give each speaker below a "
+            "little natural Indian-English flavour from their first turns on — a "
+            "couple of markers is plenty. Do NOT code-switch into Hindi.",
+            *entries,
+        ]
 
     return [
         "",
@@ -110,6 +149,81 @@ def _accent_guidance(agent_accent: str | None, user_accent: str | None) -> list[
     ]
 
 
+_LANGUAGE_DIRECTIVES: dict[str, str] = {
+    "hindi": (
+        "Write PREDOMINANTLY in Hindi (Devanagari script). English words are allowed "
+        "ONLY for terms with no natural Hindi equivalent (e.g. brand names, \"laptop\", "
+        "\"WiFi\"). Do NOT write full English sentences or clauses — every sentence's "
+        "grammar and structure must be Hindi."
+    ),
+    "hinglish": (
+        "Write genuine Hindi-English code-mixing: Hindi grammar, postpositions, and "
+        "verb-final sentence structure, with English nouns/verbs swapped in at natural "
+        "points. This is NOT an English sentence with a few Hindi words sprinkled in, "
+        "and NOT the same clause restated in both languages back-to-back."
+    ),
+    "english": (
+        "Write entirely in plain, natural English. Do NOT mix in Hindi words, "
+        "transliterations, or Devanagari script."
+    ),
+}
+
+
+def _language_directive(language: str | None) -> list[str]:
+    """Mandatory, unambiguous instruction for the exact requested language.
+
+    Keyed on the corpus's three supported registers (Hindi/Hinglish/English);
+    unrecognized values are left to the base system prompt.
+    """
+    if not language:
+        return []
+    directive = _LANGUAGE_DIRECTIVES.get(language.strip().lower())
+    if not directive:
+        return []
+    return [
+        "",
+        f"## MANDATORY language requirement: {language}",
+        directive,
+        "This applies to EVERY line, from the first turn to the last — do not drift "
+        "into a different register partway through.",
+    ]
+
+
+def _number_directive(include_numbers: bool) -> list[str]:
+    """Prompt block controlling whether the conversation is number-rich.
+
+    ``include_numbers=True`` requires several concrete figures *with the
+    reasoning around them*; ``False`` keeps the dialogue qualitative. Toggled
+    per-conversation by the runner from ``NUMBER_INCLUSION_PERCENTAGE``.
+    """
+    if include_numbers:
+        return [
+            "",
+            "## Numbers (MANDATORY for this conversation)",
+            "Weave several CONCRETE numbers naturally into the dialogue — e.g. "
+            "prices/amounts, dates, durations, quantities, percentages/discounts, "
+            "measurements, ages, scores, or distances — AND natural reasoning "
+            "around them: speakers state specific figures and then explain, "
+            "justify, or compare them the way people do OUT LOUD (why a price is "
+            "high, whether an option is worth it, weighing two choices), not just "
+            "drop a number in isolation. **Do NOT narrate arithmetic like a "
+            "calculator** — never read out a bare equation such as '45 + 200 = "
+            "245'; a real speaker just says the result ('toh total do sau "
+            "pentaalis ho gaya') and moves on. Spell numbers the way people "
+            "actually SAY them aloud in this language (this is spoken audio data), "
+            "not as bare digits where that would sound unnatural. Keep it "
+            "realistic — a few well-motivated numbers across the conversation, "
+            "not a figure crammed into every line.",
+        ]
+    return [
+        "",
+        "## Numbers",
+        "Keep this conversation qualitative: do NOT force in statistics or "
+        "specific figures. Only use a number if it is genuinely unavoidable and "
+        "natural for a passing remark.",
+    ]
+
+
 class ConversationGeneratorAgent(BaseAgent):
     """Generate a multi-turn conversation as tagged plain text.
 
@@ -118,6 +232,7 @@ class ConversationGeneratorAgent(BaseAgent):
     """
 
     prompt_name = "conversation-generator-agent"
+    temperature_key = "conversation"
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
         super().__init__(llm)
@@ -137,6 +252,7 @@ class ConversationGeneratorAgent(BaseAgent):
         previous_transcript: str | None = None,
         feedback: str | None = None,
         target_duration_sec: float | None = None,
+        include_numbers: bool = False,
         **overrides: Any,
     ) -> str:
         """Generate a full conversation for the given topic, as plain text.
@@ -161,6 +277,10 @@ class ConversationGeneratorAgent(BaseAgent):
             Validation feedback describing what was wrong with the previous attempt.
         target_duration_sec : float | None
             Approximate target duration to pace turn count against.
+        include_numbers : bool
+            When True, the dialogue must weave in concrete numbers with reasoning;
+            when False it stays qualitative. Toggled per-conversation by the runner
+            from ``NUMBER_INCLUSION_PERCENTAGE`` in config.json.
         **overrides
             Extra kwargs forwarded to the LLM (temperature, max_tokens, etc.).
 
@@ -182,13 +302,20 @@ class ConversationGeneratorAgent(BaseAgent):
             previous_transcript=previous_transcript,
             feedback=feedback,
             target_duration_sec=target_duration_sec,
+            include_numbers=include_numbers,
         )
 
         system_vars: dict[str, Any] = {}
         if conversation_type:
             system_vars["conversation_type"] = conversation_type
 
-        raw_text = self._generate(prompt, system_vars=system_vars, **overrides)
+        raw_text = self._generate(
+            prompt,
+            system_vars=system_vars,
+            stream=True,
+            stream_label=f"Generating conversation transcript ({language})…",
+            **overrides,
+        )
         transcript = self._clean(raw_text)
 
         from ..logger import Logger
@@ -213,6 +340,7 @@ class ConversationGeneratorAgent(BaseAgent):
         previous_transcript: str | None,
         feedback: str | None,
         target_duration_sec: float | None = None,
+        include_numbers: bool = False,
     ) -> str:
         """Assemble the user-side prompt sent alongside the Langfuse system prompt."""
         lines: list[str] = [
@@ -224,6 +352,8 @@ class ConversationGeneratorAgent(BaseAgent):
             f"**Context:** {context}",
             f"**Language:** {language}",
         ]
+
+        lines.extend(_language_directive(language))
 
         if conversation_type:
             lines.append(f"**Conversation type:** {conversation_type}")
@@ -240,8 +370,8 @@ class ConversationGeneratorAgent(BaseAgent):
                 f"**Gender pair (speaker_1-speaker_2, M=Male, F=Female):** {gender_pair}"
             )
 
-        # Concrete, high-salience markers for any non-Normal accent (no-op otherwise).
-        lines.extend(_accent_guidance(agent_accent, user_accent))
+        # Concrete, high-salience accent guidance (language-aware; no-op for Normal).
+        lines.extend(_accent_guidance(agent_accent, user_accent, language))
 
         if target_duration_sec is not None:
             lines.append("")
@@ -253,13 +383,19 @@ class ConversationGeneratorAgent(BaseAgent):
                 f"enough turns and content to fill it — do not end early."
             )
 
+        # Number inclusion is decided per-conversation by the runner.
+        lines.extend(_number_directive(include_numbers))
+
         if previous_transcript and feedback:
             lines.append("")
             lines.append("## PREVIOUS ATTEMPT & VALIDATION FEEDBACK")
             lines.append(
-                "Your previous attempt had issues. Read the feedback and write a NEW, "
-                "CORRECTED version of the conversation that fixes them, keeping the "
-                "exact plain-text tag format."
+                "Your previous attempt was REJECTED for the issues below. Do NOT "
+                "resubmit it with cosmetic word-swaps — actually FIX each issue: "
+                "rewrite the flagged lines and any similar ones, replace wording that "
+                "read as robotic or script-like, and add the missing accent/realism "
+                "flavour. Keep the exact plain-text tag format, but the dialogue must "
+                "be visibly different wherever the feedback points."
             )
             lines.append("")
             lines.append("### Feedback / issues to fix:")

@@ -1,15 +1,15 @@
 """Google Gemini implementation of :class:`BaseLLM`.
 
 Uses the unified ``google-genai`` SDK (``pip install google-genai``). The API key is
-read from the ``api_key`` argument or the ``GEMINI_API_KEY`` / ``GOOGLE_API_KEY``
-environment variables.
+read from the ``api_key`` argument or ``GEMINI_API_KEY`` /
+``GOOGLE_API_KEY`` in ``conversations_generator/config.json``.
 """
 
 from __future__ import annotations
 
-import os
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
+from ..configuration_reader import get as config_get
 from .base_llm import BaseLLM, LLMError, LLMResponse, Message
 
 try:  # Imported lazily-ish so the base package works without the SDK installed.
@@ -85,15 +85,51 @@ class GeminiLLM(BaseLLM):
         self.thinking_level = thinking_level
         self.thinking_budget = thinking_budget
         self.timeout = timeout
-        key = api_key or os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+        key = api_key or config_get("GEMINI_API_KEY") or config_get("GOOGLE_API_KEY")
         if not key:
             raise LLMError(
-                "No Gemini API key found. Pass api_key= or set GEMINI_API_KEY."
+                "No Gemini API key found. Pass api_key= or set GEMINI_API_KEY "
+                "in conversations_generator/config.json."
             )
         self._client = genai.Client(api_key=key)
 
     def _complete(self, messages: list[Message], **overrides: Any) -> LLMResponse:
         params = self._resolved(overrides)
+        contents, config = self._build_request(messages, overrides, params)
+
+        response = self._client.models.generate_content(
+            model=self.model,
+            contents=contents,
+            config=config,
+        )
+
+        self._raise_if_truncated(response, params["max_tokens"])
+
+        return LLMResponse(
+            text=response.text or "",
+            model=self.model,
+            usage=self._usage(response),
+            raw=response,
+        )
+
+    def _complete_stream(self, messages: list[Message], **overrides: Any) -> Iterator[str]:
+        params = self._resolved(overrides)
+        contents, config = self._build_request(messages, overrides, params)
+
+        for chunk in self._client.models.generate_content_stream(
+            model=self.model,
+            contents=contents,
+            config=config,
+        ):
+            if chunk.text:
+                yield chunk.text
+
+    def _build_request(
+        self,
+        messages: list[Message],
+        overrides: dict[str, Any],
+        params: dict[str, Any],
+    ) -> tuple[list[Any], Any]:
         system_instruction, contents = self._split_messages(messages)
 
         mime_type = overrides.get("response_mime_type")
@@ -114,21 +150,7 @@ class GeminiLLM(BaseLLM):
             response_mime_type=mime_type,
             thinking_config=thinking_config,
         )
-
-        response = self._client.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=config,
-        )
-
-        self._raise_if_truncated(response, params["max_tokens"])
-
-        return LLMResponse(
-            text=response.text or "",
-            model=self.model,
-            usage=self._usage(response),
-            raw=response,
-        )
+        return contents, config
 
     # ------------------------------------------------------------------ #
     # Thinking config

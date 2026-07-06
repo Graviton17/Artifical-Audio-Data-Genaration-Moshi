@@ -19,9 +19,11 @@ S<n>: [<tag>] -> S<ref>@<ratio> <text> (<Emotion>)
 - **`[<tag>]`** — one of `[normal] [overlap] [interrupt] [backchannel]`. Required.
 - **`-> S<ref>`** — the *other* speaker this line relates to. Required for
   `overlap`/`interrupt`/`backchannel`; omit for `normal`.
-- **`@<ratio>`** — decimal `0.00`–`1.00` right after `S<ref>` (no space): how far
-  into the referenced turn (**by word position**) this line starts. Required for
-  `overlap`/`backchannel` only; never on `interrupt`/`normal`.
+- **`@<ratio>`** — a decimal **between 0 and 1**, right after `S<ref>` (no space),
+  **always written with a leading `0.`** (e.g. `@0.6`). It is the *fraction* of the
+  way through the referenced turn, **never a word count**: a backchannel after
+  word 6 of a 12-word host is `@0.5`, NOT `@6`. Values >1 (like `@6`, `@12`) are
+  wrong. Required for `overlap`/`backchannel` only; never on `interrupt`/`normal`.
 - **`(<Emotion>)`** — `(Neutral)` `(Happy)` `(Sad)` `(Angry)`, one per line. Required.
 
 ### Tags
@@ -31,7 +33,7 @@ S<n>: [<tag>] -> S<ref>@<ratio> <text> (<Emotion>)
 | `[normal]` | Takes the floor in sequence. | none |
 | `[overlap]` | Both talk at once, neither cut off; both lines full. | ref + ratio (usually `0.0`–`0.2`) |
 | `[interrupt]` | Cuts the previous turn off. | ref, no ratio |
-| `[backchannel]` | Short listener sound (*haan, hmm, achha*) while the other talks; doesn't take the floor. | ref + ratio (`0.0`–`1.0`) |
+| `[backchannel]` | Short listener sound (*haan, hmm, achha*) while the other talks; doesn't take the floor. | ref + ratio (`0.0`–`1.0`) — **place it where the host's words actually trigger the reaction**, not a fixed spot (see below) |
 
 **Interruption rule (most common mistake):** the interrupted line ends with `—`
 and must be a **short, genuinely incomplete fragment** (≈3–8 words), NOT a full
@@ -43,6 +45,7 @@ got to voice.
 
 ```
 S1: [normal] Namaste, main Tech Solutions se. Coding ke liye laptop chahiye aapko? (Neutral)
+S2: [backchannel] -> S1@0.15 haan haan (Neutral)
 S2: [normal] Haan ji paaji, budget bas seventy hazaar tak hai. (Neutral)
 S1: [backchannel] -> S2@0.6 achha (Neutral)
 S1: [normal] Oye, seventy mein badhiya graphics wale— (Happy)
@@ -50,6 +53,10 @@ S2: [interrupt] -> S1 —graphics nahi chahiye ji, sirf coding karni hai. (Neutr
 S1: [normal] Theek hai, phir toh aur sasta pad jaayega. (Happy)
 S2: [overlap] -> S1@0.1 Chak de, wahi toh chahiye tha! (Happy)
 ```
+
+(note the two backchannels above land at different points — `@0.15` right after
+the opening greeting, `@0.6` mid-way through the budget line — because that's
+genuinely where each reaction is triggered, not because of a fixed rule.)
 
 ---
 
@@ -93,6 +100,25 @@ wrong-region address term — pick the one that fits **both the accent and the
 addressee's gender** (a Bengali speaker addressing a man says *दादा*, a woman
 *दीदी* — never North-Indian *भैया/जी*). Apply each speaker's accent independently.
 
+> **BOTH speakers carry their OWN accent — the agent is NOT accent-neutral.** A
+> common failure is giving the user vivid regional markers while the agent drifts
+> into plain/neutral Hindi or borrows the *user's* markers. Grade yourself per
+> speaker: the agent's first 1–2 turns must already show the **agent's** assigned
+> accent from ≥3 categories, using the agent's own address term — do not echo the
+> other speaker's region. E.g. a **West/Mumbai** agent uses *भाऊ, अरे यार/क्या बे,
+> एकदम, झकास, कडक, ऐसा है ना, …ना* and must **not** open with Bengali/North *दीदी/
+> भैया/दादा*; if the Mumbai term doesn't fit the addressee's gender, drop the
+> address word entirely and carry the accent through the interjection/discourse
+> markers instead — never substitute a wrong-region term.
+
+> **If the conversation language is ENGLISH, do NOT use the Hindi markers in the
+> table below — Hindi words break the English requirement.** Carry the accent
+> through Indian-English phrasing that is still English: tag *na*/*no?*, emphasis
+> with *only*/*itself*, *do one thing*, *what all*, and the odd naturalised
+> interjection (*arre*, *yaar*) used sparingly. A light touch is enough — a
+> regional accent in English is mostly pronunciation and barely shows in text, so
+> don't force heavy regional vocabulary. The marker table is Hindi/Hinglish only.
+
 | Accent | Sample markers (address · interjection · sentence-final · discourse · vocab) |
 |---|---|
 | `Punjabi` | यार/पाजी · ओए/चक दे · …जी/…ना · अरे यार, सुन ना · बिल्कुल, चंगा (direct, energetic) |
@@ -103,7 +129,16 @@ addressee's gender** (a Bengali speaker addressing a man says *दादा*, a 
 
 **emotion** — the given per-speaker emotion is the *dominant, sustained* register;
 tag most of that speaker's lines with it. Brief, content-driven reactions in
-another emotion are fine, but the assigned emotion must stay the prevailing tone.
+another emotion are fine, but the assigned emotion must stay the prevailing tone
+**including the final turns** — do NOT let an Angry user resolve into gratitude/
+relief or an assigned tone soften at the goodbye. Carry the emotion to the last
+line (an Angry user can end still unsatisfied — "देखते हैं, कुछ नहीं होगा आपसे").
+
+- **When the assigned emotion seems at odds with the scenario** (e.g. a *Happy*
+  support/complaint agent), express it through **manner**, not tone-deafness:
+  render Happy as warm, upbeat, energetic, genuinely eager-to-help — NOT as
+  cheerful about the caller's bad news. A warm, positive agent can coexist with a
+  complaint. Never make the agent sound like it's enjoying the problem.
 
 **gender_pair** (e.g. `F-M` = speaker_1 female, speaker_2 male) — never contradict
 the assigned genders in names, self-reference, or terms of address. **Hindi verbs
@@ -144,7 +179,18 @@ conversation; develop sub-topics rather than drifting to something unrelated.
 - **No padding or repetition** — length must come from genuine topic development,
   never recycled sentiments or a `question → "अच्छा" → next question` loop. Vary
   backchannel words; overlaps/interruptions must be content-plausible where they
-  land, with varied (not copy-pasted) wording.
+  land, with varied (not copy-pasted) wording. **Watch specifically for the
+  complaint/support loop** — cycling "we'll take action → when? → it takes time →
+  but I'm still waiting" three+ times is mechanical padding and FAILS. Each beat
+  must advance the matter (a new detail, a new demand, a concrete next step). When
+  the matter is genuinely exhausted, **wind down to a natural close** — a shorter,
+  non-looping conversation beats a padded one. Don't stretch to a length target by
+  re-asking things already answered (the number, the name, the plate).
+- **No brochure/script voice** — even a support or sales agent is a real person on
+  a call, not a webpage. Avoid stiff, over-polished lines ("We offer decluttering
+  services or can arrange for donations", "Our team is very efficient with sorting
+  and packing"); make the agent contract, react, hesitate, and speak like an
+  actual rep would.
 - **Never** put stage directions, narration, AI/script references, or bracketed
   meta-commentary inside a line's text.
 
@@ -152,12 +198,25 @@ conversation; develop sub-topics rather than drifting to something unrelated.
 
 ## Turn-taking minimums (checked mechanically — hard requirements)
 
-- **`[backchannel]`** — 8–10+ (≈ one per 2–4 normal turns). Rotate the word (हाँ,
-  हम्म, अच्छा, सही है, समझ गया, वाकई?, ओहो, बिल्कुल…); no word more than ~3×.
-  Prefer an accented speaker's own markers as backchannels.
+- **`[backchannel]`** — 8–10+ (≈ one per 2–4 normal turns), each a *genuine*
+  reaction, not a reflex dropped on every turn. **Rotate the word so no single one
+  repeats more than ~2×** — a stream of "I see / I understand / right / okay"
+  reads as robotic and FAILS realism. Hindi/Hinglish: हाँ, हम्म, अच्छा, सही है,
+  समझ गया, वाकई?, ओहो, बिल्कुल… English: yeah, right, hmm, oh, got it, exactly,
+  totally, oh no, mm-hm, really?… Prefer an accented speaker's own markers where
+  they fit. **Vary `@ratio`
+  across the whole `0.0`–`1.0` range, spread over the conversation** — find the
+  actual word/phrase in the host's line that would provoke the listener's
+  reaction and set the ratio there (an early key fact → `0.1`–`0.3`, a
+  mid-sentence clause → `0.4`–`0.6`, a concluding remark → `0.7`–`0.9`). Never
+  default most backchannels to the same late-ish band just because the host
+  turn is "about to end" — that reads as unnatural.
 - **`[interrupt]`** — at least 2 (truncate the victim).
-- **`[overlap]`** — at least 2 (both lines full, low ratio). Reliable spot: make
-  the closing goodbye an overlap (both say thanks/bye at once).
+- **`[overlap]`** — at least 2 (both lines full, low ratio). An overlap must point
+  at a **`[normal]`** turn — never at another overlap/interrupt/backchannel. Reliable
+  spot: the closing goodbye — but tag only **ONE** of the two goodbye lines
+  `[overlap]` (pointing at the other speaker's `[normal]` line); do NOT tag both,
+  which creates an unrepresentable chain.
 - **One relationship per turn** — never make the same turn both overlapped and
   interrupted; point each overlap/interrupt/backchannel at a turn not already in
   another relationship.
@@ -169,7 +228,8 @@ conversation; develop sub-topics rather than drifting to something unrelated.
 - Every line: `S1:`/`S2:` + one `[tag]` + (`-> Sx@ratio` where required) + `(Emotion)`.
 - Interrupt victims are short `—` fragments; the interrupter reacts only to them.
 - Counts: ≥2 `[interrupt]`, ≥2 `[overlap]`, 8–10+ varied `[backchannel]`.
-- One consistent script; non-Normal accents show ≥3 marker categories; Hindi
+- One consistent script; non-Normal accents show markers (≥3 categories in
+  Hindi/Hinglish) or light Indian-English flavour (English — no Hindi words); Hindi
   gender agreement matches gender_pair **including romanized endings**
   (male→*-unga/raha*, female→*-ungi/rahi*); formality register stays consistent.
 - conversation_type role dynamic is visible; emotions stay on their dominant tone;

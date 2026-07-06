@@ -1,9 +1,14 @@
-"""Inception Labs implementation of :class:`BaseLLM`.
+"""Sarvam AI implementation of :class:`BaseLLM`.
 
 Calls the OpenAI-style ``/v1/chat/completions`` endpoint at
-``https://api.inceptionlabs.ai`` directly via ``requests`` (Inception Labs has
-no dedicated Python SDK). The API key is read from the ``api_key`` argument or
-``INCEPTION_API_KEY`` in ``conversations_generator/config.json``.
+``https://api.sarvam.ai`` directly via ``requests`` (no SDK dependency needed,
+consistent with the other REST-based providers in this package). Sarvam's
+models are tuned for Indian languages, so this is the provider routed to for
+Hindi generation (see ``conversations_generator.llm.factory``).
+
+The API key is read from the ``api_key`` argument or ``SARVAM_API_KEY`` in
+``conversations_generator/config.json`` (via :mod:`configuration_reader`), and
+sent via the ``api-subscription-key`` header (Sarvam's documented auth mechanism).
 """
 
 from __future__ import annotations
@@ -15,20 +20,19 @@ import requests
 from ..configuration_reader import get as config_get
 from .base_llm import BaseLLM, LLMError, LLMResponse, Message
 
-_API_URL = "https://api.inceptionlabs.ai/v1/chat/completions"
+_API_URL = "https://api.sarvam.ai/v1/chat/completions"
 
 
-class InceptionLLM(BaseLLM):
-    """Chat completions backed by Inception Labs's hosted models (e.g. Mercury)."""
+class SarvamLLM(BaseLLM):
+    """Chat completions backed by Sarvam AI's hosted models (e.g. sarvam-105b)."""
 
     def __init__(
         self,
-        model: str = "mercury-2",
+        model: str = "sarvam-30b",
         *,
         api_key: str | None = None,
         temperature: float = 0.3,
         max_tokens: int | None = None,
-        reasoning_effort: str | None = "low",
         max_retries: int = 3,
         retry_backoff: float = 2.0,
         timeout: float = 120.0,
@@ -40,16 +44,15 @@ class InceptionLLM(BaseLLM):
             max_retries=max_retries,
             retry_backoff=retry_backoff,
         )
-        self.reasoning_effort = reasoning_effort
         self.timeout = timeout
-        key = api_key or config_get("INCEPTION_API_KEY")
+        key = api_key or config_get("SARVAM_API_KEY")
         if not key:
             raise LLMError(
-                "No Inception Labs API key found. Pass api_key= or set "
-                "INCEPTION_API_KEY in conversations_generator/config.json."
+                "No Sarvam API key found. Pass api_key= or set SARVAM_API_KEY "
+                "in conversations_generator/config.json."
             )
         self._headers = {
-            "Authorization": f"Bearer {key}",
+            "api-subscription-key": key,
             "Content-Type": "application/json",
         }
 
@@ -58,15 +61,12 @@ class InceptionLLM(BaseLLM):
 
         payload: dict[str, Any] = {
             "model": self.model,
-            # Inception/OpenAI use {"role", "content"} directly; "system" role is native.
+            # Sarvam/OpenAI use {"role", "content"} directly; "system" role is native.
             "messages": messages,
             "temperature": params["temperature"],
         }
         if params["max_tokens"] is not None:
             payload["max_tokens"] = params["max_tokens"]
-        reasoning_effort = overrides.get("reasoning_effort", self.reasoning_effort)
-        if reasoning_effort is not None:
-            payload["reasoning_effort"] = reasoning_effort
         if overrides.get("response_format"):
             payload["response_format"] = overrides["response_format"]
 
@@ -78,7 +78,7 @@ class InceptionLLM(BaseLLM):
         )
         if not response.ok:
             raise LLMError(
-                f"Inception Labs API request failed ({response.status_code}): {response.text}"
+                f"Sarvam API request failed ({response.status_code}): {response.text}"
             )
         data = response.json()
         choice = data["choices"][0]
@@ -101,9 +101,6 @@ class InceptionLLM(BaseLLM):
         }
         if params["max_tokens"] is not None:
             payload["max_tokens"] = params["max_tokens"]
-        reasoning_effort = overrides.get("reasoning_effort", self.reasoning_effort)
-        if reasoning_effort is not None:
-            payload["reasoning_effort"] = reasoning_effort
         if overrides.get("response_format"):
             payload["response_format"] = overrides["response_format"]
 
@@ -116,7 +113,7 @@ class InceptionLLM(BaseLLM):
         )
         if not response.ok:
             raise LLMError(
-                f"Inception Labs API request failed ({response.status_code}): {response.text}"
+                f"Sarvam API request failed ({response.status_code}): {response.text}"
             )
         # The SSE stream carries UTF-8, but the server sends no charset, so
         # requests would otherwise guess ISO-8859-1 and mangle Devanagari.

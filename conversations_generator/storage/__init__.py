@@ -3,6 +3,7 @@
 from .base_storage import BaseStorage, StorageError
 from .checkpoint import Checkpoint, InstanceProgress
 from .huggingface_storage import HuggingFaceStorage
+from .skipped import SkippedInstance, SkippedRegistry
 
 __all__ = [
     "BaseStorage",
@@ -10,4 +11,6 @@ __all__ = [
     "Checkpoint",
     "InstanceProgress",
     "HuggingFaceStorage",
+    "SkippedInstance",
+    "SkippedRegistry",
 ]
