@@ -1,6 +1,6 @@
 """LLM abstraction layer for the conversation-generation agents."""
 
-from .base_llm import BaseLLM, LLMError, LLMResponse, Message
+from .base_llm import APILimitError, BaseLLM, LLMError, LLMResponse, Message, is_api_limit_error
 from .factory import (
     DEFAULT_GENERATION_PROVIDER,
     DEFAULT_VALIDATION_PROVIDER,
@@ -16,8 +16,10 @@ from .openai_llm import OpenAILLM
 from .sarvam_llm import SarvamLLM
 
 __all__ = [
+    "APILimitError",
     "BaseLLM",
     "LLMError",
+    "is_api_limit_error",
     "LLMResponse",
     "Message",
     "LLMProvider",

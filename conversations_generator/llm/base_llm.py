@@ -34,6 +34,56 @@ class LLMError(RuntimeError):
     """Raised when a provider call fails after exhausting retries."""
 
 
+class APILimitError(RuntimeError):
+    """Raised when a provider returns a rate-limit or quota error.
+
+    Not a subclass of :class:`LLMError` so pipeline retry loops that catch
+    transient LLM failures do not swallow it — the runner terminates and saves
+    the checkpoint instead.
+    """
+
+
+def is_api_limit_error(err: Exception) -> bool:
+    """Return True when ``err`` indicates an API rate-limit or quota exhaustion."""
+    if isinstance(err, APILimitError):
+        return True
+
+    for attr in ("status_code", "status"):
+        code = getattr(err, attr, None)
+        if code == 429:
+            return True
+
+    err_type = type(err).__name__.lower()
+    if "ratelimit" in err_type or "rate_limit" in err_type:
+        return True
+
+    msg = str(err).lower()
+    if " 429" in msg or "(429)" in msg or "status_code=429" in msg:
+        return True
+
+    keywords = (
+        "rate limit",
+        "rate_limit",
+        "ratelimit",
+        "too many requests",
+        "quota exceeded",
+        "insufficient_quota",
+        "resource exhausted",
+        "resource_exhausted",
+        "billing hard limit",
+        "exceeded your current quota",
+    )
+    return any(keyword in msg for keyword in keywords)
+
+
+def _reraise_if_api_limit(err: Exception) -> None:
+    """Re-raise API-limit errors immediately (no further retries)."""
+    if is_api_limit_error(err):
+        if isinstance(err, APILimitError):
+            raise err
+        raise APILimitError(str(err)) from err
+
+
 class BaseLLM(ABC):
     """Base class for chat-completion LLMs.
 
@@ -78,6 +128,7 @@ class BaseLLM(ABC):
             try:
                 return self._complete(messages, **overrides).text
             except Exception as err:  # noqa: BLE001 - normalized into LLMError below
+                _reraise_if_api_limit(err)
                 last_err = err
                 if attempt == self.max_retries:
                     break
@@ -113,6 +164,7 @@ class BaseLLM(ABC):
                         on_chunk(chunk)
                 return "".join(chunks)
             except Exception as err:  # noqa: BLE001 - normalized into LLMError below
+                _reraise_if_api_limit(err)
                 last_err = err
                 if attempt == self.max_retries:
                     break

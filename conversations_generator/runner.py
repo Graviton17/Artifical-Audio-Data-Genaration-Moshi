@@ -59,6 +59,7 @@ from .configuration_reader import (
     is_production,
 )
 from .llm import (
+    APILimitError,
     DEFAULT_GENERATION_PROVIDER,
     DEFAULT_VALIDATION_PROVIDER,
     BaseLLM,
@@ -826,9 +827,28 @@ class ConversationRunner:
 # that fail validation, so a persistently-failing profile can't loop forever.
 MAX_CONSECUTIVE_FAILURES = 10
 
-# Local on-disk dump of every accepted conversation (dev and prod).
+# Local on-disk dump of accepted conversations (development only).
 # Layout: <repo>/output/<run_id>/conversation.json + metadata.txt
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
+
+
+def _save_checkpoint_before_shutdown(
+    storage: BaseStorage | None,
+    checkpoint: Checkpoint | None,
+    *,
+    reason: str,
+) -> None:
+    """Best-effort checkpoint persist before terminating a production run."""
+    if storage is None or checkpoint is None:
+        return
+    try:
+        storage.save_checkpoint(checkpoint)
+        Logger.warning(
+            f"Checkpoint saved before shutdown ({reason}): "
+            f"{len(checkpoint.instances)} instance record(s)."
+        )
+    except StorageError as err:
+        Logger.error(f"Failed to save checkpoint before shutdown: {err}")
 
 
 def _conversation_payload(instance: CorpusInstance, index: int, result: dict[str, Any]) -> dict[str, Any]:
@@ -1078,7 +1098,17 @@ def process_instance(
             f"{progress.generated_sec / target_sec * 100 if target_sec else 0:.1f}%)"
         )
 
-        result = runner.run(**instance.to_profile())
+        try:
+            result = runner.run(**instance.to_profile())
+        except APILimitError as err:
+            Logger.error(f"API limit hit during conversation {index}: {err}")
+            _save_checkpoint_before_shutdown(
+                storage,
+                checkpoint,
+                reason="API rate-limit or quota exceeded",
+            )
+            raise
+
         manual_report = result.get("manual_validation")
         duration = getattr(manual_report, "duration_sec", None)
 
@@ -1127,13 +1157,13 @@ def process_instance(
         consecutive_failures = 0
         accepted += 1
 
-        # Always dump accepted conversations under output/<run_id>/ so the JSON
-        # (and a metadata sidecar) is available locally regardless of MODE.
-        try:
-            local_dir = save_local_output(instance, index, result)
-            Logger.success(f"Wrote local output → {local_dir}")
-        except OSError as err:
-            Logger.warning(f"Failed to write local output for conversation {index}: {err}")
+        # Development only: dump accepted conversations under output/<run_id>/.
+        if not is_production():
+            try:
+                local_dir = save_local_output(instance, index, result)
+                Logger.success(f"Wrote local output → {local_dir}")
+            except OSError as err:
+                Logger.warning(f"Failed to write local output for conversation {index}: {err}")
 
         if storage is not None and checkpoint is not None:
             # Upload the conversation, THEN advance + persist the checkpoint. The
@@ -1364,7 +1394,14 @@ def main(argv: list[str] | None = None) -> None:
             )
             continue
         runner = _get_runner(runner_cache, args.model, args.validation_model, instance.language)
-        process_instance(runner, instance, storage, checkpoint, max_conversations, skipped)
+        try:
+            process_instance(runner, instance, storage, checkpoint, max_conversations, skipped)
+        except APILimitError:
+            Logger.error(
+                "Terminating run: API rate-limit or quota exceeded. "
+                "Resume later from the saved checkpoint."
+            )
+            return
 
     Logger.divider()
     Logger.success("All requested instances processed.", bold=True)
