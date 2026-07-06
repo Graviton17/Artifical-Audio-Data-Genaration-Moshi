@@ -126,6 +126,7 @@ class ConversationFormatterAgent(BaseAgent):
 
     prompt_name = "conversation-formatter-agent"
     temperature_key = "formatter"
+    agent_name = "formatter"
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
         super().__init__(llm)

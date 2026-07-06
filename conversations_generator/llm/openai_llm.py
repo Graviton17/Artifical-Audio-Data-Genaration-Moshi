@@ -80,6 +80,7 @@ class OpenAILLM(BaseLLM):
             "messages": messages,
             "temperature": params["temperature"],
             "stream": True,
+            "stream_options": {"include_usage": True},
         }
         if params["max_tokens"] is not None:
             kwargs["max_tokens"] = params["max_tokens"]
@@ -87,6 +88,9 @@ class OpenAILLM(BaseLLM):
             kwargs["response_format"] = overrides["response_format"]
 
         for event in self._client.chat.completions.create(**kwargs):
+            usage = getattr(event, "usage", None)
+            if usage:
+                self._last_usage = self._usage(event)
             delta = event.choices[0].delta.content if event.choices else None
             if delta:
                 yield delta

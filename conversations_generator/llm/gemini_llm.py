@@ -121,6 +121,9 @@ class GeminiLLM(BaseLLM):
             contents=contents,
             config=config,
         ):
+            meta = getattr(chunk, "usage_metadata", None)
+            if meta:
+                self._last_usage = self._usage(chunk)
             if chunk.text:
                 yield chunk.text
 

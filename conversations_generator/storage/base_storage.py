@@ -57,6 +57,9 @@ class BaseStorage(ABC):
         corpus_combination_id: int,
         index: int,
         payload: dict[str, Any],
+        *,
+        metadata_text: str | None = None,
+        transcript_text: str | None = None,
     ) -> str:
         """Persist one conversation under its instance folder.
 

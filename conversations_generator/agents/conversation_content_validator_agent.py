@@ -123,6 +123,7 @@ class ConversationContentValidatorAgent(BaseAgent):
 
     prompt_name = "conversation-content-validator-agent"
     temperature_key = "validator"
+    agent_name = "content_validator"
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
         super().__init__(llm)

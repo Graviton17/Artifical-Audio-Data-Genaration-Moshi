@@ -123,6 +123,17 @@ class HuggingFaceStorage(BaseStorage):
         finally:
             local.unlink(missing_ok=True)
 
+    def _upload_text(self, path_in_bucket: str, text: str) -> None:
+        """Upload a plain-text file to ``path_in_bucket``."""
+        local = self._tmp / path_in_bucket.replace("/", "__")
+        local.write_text(text, encoding="utf-8")
+        try:
+            batch_bucket_files(self.bucket_id, add=[(str(local), path_in_bucket)])
+        except Exception as err:  # noqa: BLE001
+            raise StorageError(f"Failed to upload {path_in_bucket}: {err}") from err
+        finally:
+            local.unlink(missing_ok=True)
+
     # ------------------------------------------------------------------ #
     # Conversations
     # ------------------------------------------------------------------ #
@@ -131,12 +142,20 @@ class HuggingFaceStorage(BaseStorage):
         corpus_combination_id: int,
         index: int,
         payload: dict[str, Any],
+        *,
+        metadata_text: str | None = None,
+        transcript_text: str | None = None,
     ) -> str:
-        path_in_bucket = (
-            f"{self.instance_folder(corpus_combination_id)}/"
-            f"{self.conversation_name(index)}"
-        )
+        folder = self.instance_folder(corpus_combination_id)
+        path_in_bucket = f"{folder}/{self.conversation_name(index)}"
         self._upload_json(path_in_bucket, payload)
+
+        base = f"{folder}/conversation_{index:04d}"
+        if metadata_text is not None:
+            self._upload_text(f"{base}_metadata.txt", metadata_text)
+        if transcript_text:
+            self._upload_text(f"{base}_transcript.txt", transcript_text)
+
         return f"{_BUCKET_PREFIX}{self.bucket_id}/{path_in_bucket}"
 
     # ------------------------------------------------------------------ #

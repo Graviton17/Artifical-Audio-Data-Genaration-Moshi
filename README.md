@@ -133,3 +133,13 @@ python -m conversations_generator.runner --model=sarvam --validation=gemini
 python -m conversations_generator.runner --language=hindi
 python -m conversations_generator.runner --language=hinglish --model=gemini
 python -m conversations_generator.runner --language=english
+
+
+<!-- MOST IMP -->
+
+python -m conversations_generator.runner \
+  --language=english \
+  --corpus-size=60 \
+  --workers=3 \
+  --model=krutrim \
+  --validation-model=krutrim

@@ -112,6 +112,7 @@ class ConversationEditorAgent(BaseAgent):
     # Not backed by Langfuse; prompt_name is only used for the base-class check.
     prompt_name = "conversation-editor-agent"
     temperature_key = "editor"
+    agent_name = "editor"
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
         # Bypass Langfuse: install the self-contained system prompt directly so

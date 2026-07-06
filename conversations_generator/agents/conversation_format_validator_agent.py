@@ -108,6 +108,7 @@ class ConversationFormatValidatorAgent(BaseAgent):
 
     prompt_name = "conversation-format-validator-agent"
     temperature_key = "validator"
+    agent_name = "format_validator"
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
         super().__init__(llm)

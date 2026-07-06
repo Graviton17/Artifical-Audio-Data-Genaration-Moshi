@@ -56,6 +56,19 @@ class BaseLLM(ABC):
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
+        self._last_usage: dict[str, int] = {}
+        self._last_model: str = model
+
+    @property
+    def last_usage(self) -> dict[str, int]:
+        """Token counts from the most recent successful provider call."""
+        return dict(self._last_usage)
+
+    def _store_response(self, response: LLMResponse) -> LLMResponse:
+        """Remember usage/model from a provider response for downstream tracking."""
+        self._last_usage = dict(response.usage or {})
+        self._last_model = response.model or self.model
+        return response
 
     # ------------------------------------------------------------------ #
     # Public API used by agents
@@ -76,7 +89,7 @@ class BaseLLM(ABC):
         last_err: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                return self._complete(messages, **overrides).text
+                return self._store_response(self._complete(messages, **overrides)).text
             except Exception as err:  # noqa: BLE001 - normalized into LLMError below
                 last_err = err
                 if attempt == self.max_retries:
@@ -111,7 +124,11 @@ class BaseLLM(ABC):
                     chunks.append(chunk)
                     if on_chunk is not None:
                         on_chunk(chunk)
-                return "".join(chunks)
+                text = "".join(chunks)
+                # Streaming providers often omit usage; keep prior counts if unset.
+                if not self._last_usage:
+                    self._last_model = self.model
+                return text
             except Exception as err:  # noqa: BLE001 - normalized into LLMError below
                 last_err = err
                 if attempt == self.max_retries:
@@ -223,11 +240,39 @@ class BaseLLM(ABC):
             except json.JSONDecodeError:
                 continue
             choices = event.get("choices") or []
-            if not choices:
+            if choices:
+                delta = (choices[0].get("delta") or {}).get("content")
+                if delta:
+                    yield delta
+
+    def _iter_sse_content_tracked(
+        self,
+        lines: Iterator[bytes | str],
+    ) -> Iterator[str]:
+        """Like :meth:`_iter_sse_content`, but records ``usage`` on ``self``."""
+        for line in lines:
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", errors="replace")
+            if not line or not line.startswith("data:"):
                 continue
-            delta = (choices[0].get("delta") or {}).get("content")
-            if delta:
-                yield delta
+            payload = line[len("data:"):].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            usage = event.get("usage")
+            if usage:
+                self._last_usage = {
+                    "input": usage.get("prompt_tokens", 0) or 0,
+                    "output": usage.get("completion_tokens", 0) or 0,
+                }
+            choices = event.get("choices") or []
+            if choices:
+                delta = (choices[0].get("delta") or {}).get("content")
+                if delta:
+                    yield delta
 
     @staticmethod
     def _parse_json(text: str) -> Any:

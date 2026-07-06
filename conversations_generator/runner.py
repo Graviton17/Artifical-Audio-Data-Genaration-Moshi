@@ -14,8 +14,16 @@ by regenerating the transcript; formatting problems are fixed by re-formatting.
     python -m conversations_generator.runner --language=english --model=gemini
     python -m conversations_generator.runner --model=sarvam --validation-model=gemma
 
+    python -m conversations_generator.runner --language=english --corpus-size=120 --workers=4
+
 ``--language`` restricts the run to one corpus language (``hindi`` / ``hinglish``
 / ``english``); omit it to process every language, as before.
+
+``--corpus-size`` caps total generated audio duration (minutes) for the filtered
+language(s). Generation stops once accepted conversations reach that total.
+
+``--workers`` runs up to N instances in parallel (1–10). Each worker maintains
+its own LLM clients; checkpoint updates are serialized.
 
 ``--model`` is **generation only** (topic + conversation transcript) and always
 wins when given, for any language. Only when it's *omitted* does Hindi default
@@ -31,7 +39,9 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import threading
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -71,6 +81,7 @@ from .llm import (
 from .loaders import read_corpus_instances
 from .logger import Logger
 from .models import CorpusInstance
+from .usage_tracker import UsageTracker, usage_context
 from .storage import (
     BaseStorage,
     Checkpoint,
@@ -131,6 +142,36 @@ def sample_target_duration_sec(
 SARVAM_GENERATION_TEMPERATURE = 0.7
 GENERATION_TEMPERATURE_RETRY_STEP = 0.15
 GENERATION_TEMPERATURE_MAX = 0.95
+
+
+class CorpusBudget:
+    """Thread-safe cap on total accepted duration for a language-filtered run."""
+
+    def __init__(self, target_sec: float | None, initial_sec: float = 0.0) -> None:
+        self.target_sec = target_sec
+        self._generated_sec = initial_sec
+        self._lock = threading.Lock()
+
+    @property
+    def generated_sec(self) -> float:
+        with self._lock:
+            return self._generated_sec
+
+    def can_continue(self) -> bool:
+        if self.target_sec is None:
+            return True
+        with self._lock:
+            return self._generated_sec < self.target_sec
+
+    def remaining_sec(self) -> float | None:
+        if self.target_sec is None:
+            return None
+        with self._lock:
+            return max(0.0, self.target_sec - self._generated_sec)
+
+    def add(self, duration_sec: float) -> None:
+        with self._lock:
+            self._generated_sec += duration_sec
 
 
 class ConversationRunner:
@@ -229,7 +270,11 @@ class ConversationRunner:
     # ------------------------------------------------------------------ #
     # Stage 1: topic
     # ------------------------------------------------------------------ #
-    def generate_topic(self, **profile: Any) -> dict[str, str]:
+    def generate_topic(
+        self,
+        usage_tracker: UsageTracker,
+        **profile: Any,
+    ) -> dict[str, str]:
         """Produce the next single topic (see ``TopicGeneratorAgent.run``).
 
         The topic call is JSON-mode, and the model occasionally returns an empty
@@ -242,7 +287,8 @@ class ConversationRunner:
         last_err: Exception | None = None
         for attempt in range(1, self.max_generation_attempts + 1):
             try:
-                topic = self.topic_agent.run(**profile)
+                with usage_context(usage_tracker, stage="topic", attempt=attempt):
+                    topic = self.topic_agent.run(**profile)
                 Logger.success(f"Topic generated: {topic.get('title', 'Unknown Title')}")
                 return topic
             except (ValueError, LLMError) as err:
@@ -363,6 +409,8 @@ class ConversationRunner:
         """
         Logger.step(f"Starting pipeline for language: {profile.get('language', 'unknown')}")
 
+        usage_tracker = UsageTracker()
+
         # Decide ONCE per conversation whether this one is number-rich, drawn from
         # NUMBER_INCLUSION_PERCENTAGE (default 50%). Fixed for the whole pipeline
         # (topic + every regeneration) so the topic and dialogue stay aligned.
@@ -372,7 +420,7 @@ class ConversationRunner:
         )
 
         try:
-            topic = self.generate_topic(include_numbers=include_numbers, **profile)
+            topic = self.generate_topic(usage_tracker, include_numbers=include_numbers, **profile)
         except (ValueError, LLMError) as err:
             # Topic generation exhausted its retries (e.g. the model kept returning
             # empty/invalid JSON). Fail THIS conversation gracefully instead of
@@ -398,6 +446,7 @@ class ConversationRunner:
                 "max_format_attempts": self.max_format_attempts,
                 "max_content_validation_retries": self.max_content_validation_retries,
                 "max_format_validation_retries": self.max_format_validation_retries,
+                "usage": usage_tracker.to_dict(),
                 "passed": False,
             }
 
@@ -444,17 +493,22 @@ class ConversationRunner:
                 f"temperature {gen_temperature:.2f}..."
             )
             try:
-                transcript = self.generator_agent.run(
-                    title=topic["title"],
-                    context=topic.get("context", ""),
-                    conversation_type=topic.get("conversation_type"),
-                    previous_transcript=previous_transcript,
-                    feedback=generator_feedback,
-                    target_duration_sec=target_duration_sec,
-                    include_numbers=include_numbers,
-                    temperature=gen_temperature,
-                    **profile,
-                )
+                with usage_context(
+                    usage_tracker,
+                    stage="conversation_generation",
+                    attempt=gen_attempt,
+                ):
+                    transcript = self.generator_agent.run(
+                        title=topic["title"],
+                        context=topic.get("context", ""),
+                        conversation_type=topic.get("conversation_type"),
+                        previous_transcript=previous_transcript,
+                        feedback=generator_feedback,
+                        target_duration_sec=target_duration_sec,
+                        include_numbers=include_numbers,
+                        temperature=gen_temperature,
+                        **profile,
+                    )
             except (ValueError, LLMError) as err:
                 Logger.warning(f"Transcript generation failed: {err}")
                 generator_feedback = f"Conversation generation error on the previous attempt: {err}"
@@ -467,7 +521,7 @@ class ConversationRunner:
                 f"Stage 3: Content Validation (attempt {gen_attempt}/{self.max_generation_attempts})"
             )
             content_report, content_validation_attempts_used = self._run_content_validation(
-                transcript, topic, profile
+                transcript, topic, profile, usage_tracker, gen_attempt
             )
 
             if content_report is None:
@@ -522,6 +576,7 @@ class ConversationRunner:
                 "max_format_attempts": self.max_format_attempts,
                 "max_content_validation_retries": self.max_content_validation_retries,
                 "max_format_validation_retries": self.max_format_validation_retries,
+                "usage": usage_tracker.to_dict(),
                 "passed": False,
             }
 
@@ -557,14 +612,19 @@ class ConversationRunner:
 
             Logger.info("Formatting transcript into schema turns...")
             try:
-                turns = self.formatter_agent.run(
-                    transcript=transcript,
-                    agent_emotion=profile.get("agent_emotion"),
-                    user_emotion=profile.get("user_emotion"),
-                    language=profile.get("language"),
-                    feedback=formatter_feedback,
-                    previous_output=previous_output,
-                )
+                with usage_context(
+                    usage_tracker,
+                    stage="formatting",
+                    attempt=fmt_attempt,
+                ):
+                    turns = self.formatter_agent.run(
+                        transcript=transcript,
+                        agent_emotion=profile.get("agent_emotion"),
+                        user_emotion=profile.get("user_emotion"),
+                        language=profile.get("language"),
+                        feedback=formatter_feedback,
+                        previous_output=previous_output,
+                    )
             except (ValueError, LLMError) as err:
                 Logger.warning(f"Formatting failed: {err}")
                 formatter_feedback = f"Formatting error on the previous attempt: {err}"
@@ -589,7 +649,7 @@ class ConversationRunner:
 
             # ---- Stage 4b: LLM faithfulness gate (conversion fidelity only) ----
             format_report, format_validation_attempts_used = self._run_format_validation(
-                transcript, turns
+                transcript, turns, usage_tracker, fmt_attempt
             )
             if format_report is None:
                 Logger.warning(
@@ -610,7 +670,9 @@ class ConversationRunner:
             # Patch only the flagged turns (restore a reworded turn to the
             # transcript, drop an extra one) instead of re-running the whole
             # formatter. If editing makes it faithful + manual-valid: done.
-            edit_result = self._repair_by_editing(turns, transcript, format_report, profile)
+            edit_result = self._repair_by_editing(
+                turns, transcript, format_report, profile, usage_tracker
+            )
             if edit_result is not None:
                 turns, edited_manual, edited_format = edit_result
                 manual_report = edited_manual
@@ -669,6 +731,7 @@ class ConversationRunner:
             "max_format_attempts": self.max_format_attempts,
             "max_content_validation_retries": self.max_content_validation_retries,
             "max_format_validation_retries": self.max_format_validation_retries,
+            "usage": usage_tracker.to_dict(),
             # Accept only if content was approved (or bypassed) and the formatting
             # passed deterministic manual validation. The LLM faithfulness judge is
             # advisory: it must pass, be bypassed (unavailable), or have exhausted
@@ -690,6 +753,8 @@ class ConversationRunner:
         transcript: str,
         topic: dict[str, str],
         profile: dict[str, Any],
+        usage_tracker: UsageTracker,
+        generation_attempt: int,
     ) -> tuple[ContentValidationReport | None, int]:
         """Call the content judge, retrying transient call failures.
 
@@ -701,7 +766,14 @@ class ConversationRunner:
         for attempt in range(1, self.max_content_validation_retries + 1):
             attempts_used = attempt
             try:
-                report = self.content_validator.run(transcript=transcript, topic=topic, **profile)
+                with usage_context(
+                    usage_tracker,
+                    stage="content_validation",
+                    attempt=generation_attempt * 100 + attempt,
+                ):
+                    report = self.content_validator.run(
+                        transcript=transcript, topic=topic, **profile
+                    )
                 break
             except (ValueError, LLMError) as err:
                 Logger.warning(
@@ -714,6 +786,8 @@ class ConversationRunner:
         self,
         transcript: str,
         turns: list[dict[str, Any]],
+        usage_tracker: UsageTracker,
+        format_attempt: int,
     ) -> tuple[FormatValidationReport | None, int]:
         """Call the faithfulness judge, retrying transient call failures.
 
@@ -725,7 +799,12 @@ class ConversationRunner:
         for attempt in range(1, self.max_format_validation_retries + 1):
             attempts_used = attempt
             try:
-                report = self.format_validator.run(transcript=transcript, turns=turns)
+                with usage_context(
+                    usage_tracker,
+                    stage="format_validation",
+                    attempt=format_attempt * 100 + attempt,
+                ):
+                    report = self.format_validator.run(transcript=transcript, turns=turns)
                 break
             except (ValueError, LLMError) as err:
                 Logger.warning(
@@ -740,6 +819,7 @@ class ConversationRunner:
         transcript: str,
         format_report: FormatValidationReport,
         profile: dict[str, Any],
+        usage_tracker: UsageTracker,
     ) -> tuple[list[dict[str, Any]], ValidationReport, FormatValidationReport | None] | None:
         """Fix a faithfulness failure with targeted per-turn edits.
 
@@ -765,13 +845,18 @@ class ConversationRunner:
                 f"Stage 4c: Targeted edit repair (attempt {edit_attempt}/{self.max_edit_attempts})"
             )
             try:
-                edits = self.editor_agent.run(
-                    turns=current_turns,
-                    issues=current_report.issues,
-                    feedback=current_report.feedback,
-                    transcript=transcript,
-                    **profile,
-                )
+                with usage_context(
+                    usage_tracker,
+                    stage="editor",
+                    attempt=edit_attempt,
+                ):
+                    edits = self.editor_agent.run(
+                        turns=current_turns,
+                        issues=current_report.issues,
+                        feedback=current_report.feedback,
+                        transcript=transcript,
+                        **profile,
+                    )
             except (ValueError, LLMError) as err:
                 Logger.warning(f"Editor call failed: {err}. Falling back to re-formatting.")
                 return None
@@ -803,7 +888,9 @@ class ConversationRunner:
             Logger.success(f"Edits applied and passed manual validation (attempt {edit_attempt}).")
             current_turns = edited_turns
 
-            new_report, _ = self._run_format_validation(transcript, current_turns)
+            new_report, _ = self._run_format_validation(
+                transcript, current_turns, usage_tracker, edit_attempt
+            )
             if new_report is None:
                 Logger.warning("Faithfulness re-validation unavailable after edits; accepting edited conversation.")
                 return current_turns, manual_report, None
@@ -843,6 +930,7 @@ def _conversation_payload(instance: CorpusInstance, index: int, result: dict[str
         "passed": result.get("passed", False),
         "include_numbers": result.get("include_numbers", False),
         "turns": result.get("turns", []),
+        "usage": result.get("usage"),
     }
 
 
@@ -960,8 +1048,47 @@ def _build_metadata_text(
     else:
         lines.append("verdict: (bypassed or unavailable)")
 
+    usage = result.get("usage")
+    if usage:
+        lines += _usage_metadata_lines(usage)
+
     lines.append("")
     return "\n".join(lines)
+
+
+def _usage_metadata_lines(usage: dict[str, Any]) -> list[str]:
+    """Render usage dict into metadata.txt lines."""
+    totals = usage.get("totals") or {}
+    lines = [
+        "",
+        "## LLM usage",
+        f"total_calls: {totals.get('calls', 0)}",
+        f"total_input_tokens: {totals.get('input_tokens', 0)}",
+        f"total_output_tokens: {totals.get('output_tokens', 0)}",
+        f"total_tokens: {totals.get('total_tokens', 0)}",
+        f"total_llm_duration_sec: {totals.get('duration_sec', 0)}",
+        "",
+        "### By agent",
+    ]
+    by_agent = usage.get("by_agent") or {}
+    for agent, stats in sorted(by_agent.items()):
+        lines.append(
+            f"{agent}: calls={stats.get('calls', 0)}, "
+            f"in={stats.get('input_tokens', 0)}, out={stats.get('output_tokens', 0)}, "
+            f"total={stats.get('total_tokens', 0)}, "
+            f"duration_sec={stats.get('duration_sec', 0)}"
+        )
+    lines += ["", "### Per call (chronological)"]
+    for call in usage.get("calls") or []:
+        attempt = call.get("attempt")
+        attempt_s = f", attempt={attempt}" if attempt is not None else ""
+        lines.append(
+            f"- [{call.get('stage', '')}{attempt_s}] {call.get('agent', '')} "
+            f"({call.get('model', '')}): in={call.get('input_tokens', 0)}, "
+            f"out={call.get('output_tokens', 0)}, "
+            f"duration_sec={call.get('duration_sec', 0)}"
+        )
+    return lines
 
 
 def save_local_output(
@@ -1015,6 +1142,8 @@ def process_instance(
     checkpoint: Checkpoint | None = None,
     max_conversations: int | None = None,
     skipped: SkippedRegistry | None = None,
+    corpus_budget: CorpusBudget | None = None,
+    storage_lock: threading.Lock | None = None,
 ) -> float:
     """Generate conversations for one instance until its target duration is met.
 
@@ -1068,6 +1197,12 @@ def process_instance(
     accepted = 0  # conversations accepted this run (for the max_conversations cap)
 
     while progress.generated_sec < target_sec:
+        if corpus_budget is not None and not corpus_budget.can_continue():
+            Logger.info(
+                f"Corpus size target reached ({corpus_budget.generated_sec / 60:.2f} min); "
+                f"stopping instance {instance.corpus_combination_id}."
+            )
+            break
         if max_conversations is not None and accepted >= max_conversations:
             break
         index += 1
@@ -1099,19 +1234,21 @@ def process_instance(
                 # failure here must not crash the whole run.
                 if storage is not None and skipped is not None:
                     try:
-                        skipped.add(
-                            SkippedInstance(
-                                corpus_combination_id=instance.corpus_combination_id,
-                                consecutive_failures=consecutive_failures,
-                                reason=f"{MAX_CONSECUTIVE_FAILURES} consecutive validation failures",
-                                generated_sec=progress.generated_sec,
-                                target_sec=target_sec,
-                                conversation_count=progress.conversation_count,
-                                language=instance.language,
-                                gender_pair=instance.gender_pair,
+                        lock = storage_lock or threading.Lock()
+                        with lock:
+                            skipped.add(
+                                SkippedInstance(
+                                    corpus_combination_id=instance.corpus_combination_id,
+                                    consecutive_failures=consecutive_failures,
+                                    reason=f"{MAX_CONSECUTIVE_FAILURES} consecutive validation failures",
+                                    generated_sec=progress.generated_sec,
+                                    target_sec=target_sec,
+                                    conversation_count=progress.conversation_count,
+                                    language=instance.language,
+                                    gender_pair=instance.gender_pair,
+                                )
                             )
-                        )
-                        storage.save_skipped(skipped)
+                            storage.save_skipped(skipped)
                         Logger.warning(
                             f"Recorded instance {instance.corpus_combination_id} in "
                             f"{storage.SKIPPED_NAME} (bucket root)."
@@ -1140,14 +1277,27 @@ def process_instance(
             # conversation lands in the bucket before the checkpoint claims it,
             # so a crash between the two just regenerates it — the checkpoint
             # never points at a missing file.
+            metadata_text = _build_metadata_text(
+                f"instance_{instance.corpus_combination_id:04d}_conv{index:04d}",
+                instance,
+                index,
+                result,
+            )
+            transcript_text = result.get("transcript") or ""
             try:
-                path = storage.save_conversation(
-                    instance.corpus_combination_id,
-                    index,
-                    _conversation_payload(instance, index, result),
-                )
-                checkpoint.record(progress, duration)
-                storage.save_checkpoint(checkpoint)
+                lock = storage_lock or threading.Lock()
+                with lock:
+                    path = storage.save_conversation(
+                        instance.corpus_combination_id,
+                        index,
+                        _conversation_payload(instance, index, result),
+                        metadata_text=metadata_text,
+                        transcript_text=transcript_text or None,
+                    )
+                    checkpoint.record(progress, duration)
+                    storage.save_checkpoint(checkpoint)
+                    if corpus_budget is not None:
+                        corpus_budget.add(duration)
             except StorageError as err:
                 Logger.error(f"Storage failure on conversation {index}, aborting instance: {err}")
                 break
@@ -1160,6 +1310,8 @@ def process_instance(
             # Development: count locally, don't upload to the remote bucket.
             progress.generated_sec += duration
             progress.conversation_count += 1
+            if corpus_budget is not None:
+                corpus_budget.add(duration)
             Logger.success(
                 f"Conversation {index} accepted (+{duration:.0f}s) — "
                 f"total {progress.generated_sec:.0f}/{target_sec:.0f}s",
@@ -1210,6 +1362,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "LLM provider for the *formatter* and *LLM agent validator* "
             f"(not generation). Default: '{DEFAULT_VALIDATION_PROVIDER.value}'."
+        ),
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        choices=range(1, 11),
+        metavar="N",
+        help="Number of parallel instance workers (1–10). Default: 1.",
+    )
+    parser.add_argument(
+        "--corpus-size",
+        type=float,
+        default=None,
+        metavar="MINUTES",
+        help=(
+            "Stop once total accepted conversation duration for the filtered "
+            "language(s) reaches this many minutes."
         ),
     )
     return parser.parse_args(argv)
@@ -1268,6 +1438,76 @@ def _get_runner(
     return runner_cache[cache_key]
 
 
+_thread_local = threading.local()
+
+
+def _thread_runner_cache() -> dict[tuple[LLMProvider, LLMProvider], ConversationRunner]:
+    cache = getattr(_thread_local, "runner_cache", None)
+    if cache is None:
+        cache = {}
+        _thread_local.runner_cache = cache
+    return cache
+
+
+def _initial_corpus_generated_sec(
+    checkpoint: Checkpoint | None,
+    corpus_df: Any,
+) -> float:
+    """Sum accepted duration already recorded for instances in this run scope."""
+    if checkpoint is None:
+        return 0.0
+    ids = set(corpus_df["corpus_combination_id"].tolist())
+    total = 0.0
+    for prog in checkpoint.instances.values():
+        if prog.corpus_combination_id in ids:
+            total += prog.generated_sec
+    return total
+
+
+def _process_corpus_index(
+    index: int,
+    corpus_df: Any,
+    args: argparse.Namespace,
+    *,
+    storage: BaseStorage | None,
+    checkpoint: Checkpoint | None,
+    skipped: SkippedRegistry | None,
+    max_conversations: int | None,
+    corpus_budget: CorpusBudget | None,
+    storage_lock: threading.Lock | None,
+) -> float:
+    """Process one corpus row (used by sequential and parallel drivers)."""
+    if corpus_budget is not None and not corpus_budget.can_continue():
+        return 0.0
+
+    row: dict[str, Any] = {str(k): v for k, v in corpus_df.iloc[index].to_dict().items()}
+    instance = CorpusInstance.from_dict(row)
+
+    if skipped is not None and instance.corpus_combination_id in skipped:
+        Logger.warning(
+            f"Skipping instance {instance.corpus_combination_id} — "
+            f"already recorded in {BaseStorage.SKIPPED_NAME}."
+        )
+        return 0.0
+
+    runner = _get_runner(
+        _thread_runner_cache(),
+        args.model,
+        args.validation_model,
+        instance.language,
+    )
+    return process_instance(
+        runner,
+        instance,
+        storage,
+        checkpoint,
+        max_conversations,
+        skipped,
+        corpus_budget,
+        storage_lock,
+    )
+
+
 def main(argv: list[str] | None = None) -> None:
     # Load API keys / settings from conversations_generator/config.json and
     # mirror them into os.environ for any third-party SDK that only reads env.
@@ -1302,21 +1542,17 @@ def main(argv: list[str] | None = None) -> None:
         f"Providers — generation(--model)={args.model or DEFAULT_GENERATION_PROVIDER.value}"
         f"{hindi_note}, validation/formatter(--validation-model)={args.validation_model}"
     )
-
-    # Runners are cached by (generation_provider, validation_provider) because
-    # generation can differ per instance (Hindi → Sarvam) while validation is
-    # fixed for the whole CLI invocation.
-    runner_cache: dict[tuple[LLMProvider, LLMProvider], ConversationRunner] = {}
+    Logger.info(f"Parallel workers: {args.workers}")
 
     # Storage + checkpoint are production-only. Dev runs entirely in memory.
     storage: BaseStorage | None = None
     checkpoint: Checkpoint | None = None
     skipped: SkippedRegistry | None = None
     # In development, cap at a single conversation per instance; production
-    # chases each instance's full duration target.
+    # chases each instance's full duration target (unless --corpus-size is set).
     max_conversations: int | None = None
     if production:
-        Logger.step(f"PRODUCTION run — processing all {len(corpus_df)} instances in sequence.")
+        Logger.step(f"PRODUCTION run — processing all {len(corpus_df)} instances.")
         storage = HuggingFaceStorage()
         checkpoint = storage.load_checkpoint()
         Logger.info(f"Loaded checkpoint with {len(checkpoint.instances)} instance record(s).")
@@ -1324,47 +1560,71 @@ def main(argv: list[str] | None = None) -> None:
         Logger.info(
             f"Loaded skipped registry with {len(skipped.instances)} abandoned instance(s)."
         )
-        indices = range(len(corpus_df))
+        indices = list(range(len(corpus_df)))
     else:
-        Logger.step("DEVELOPMENT run — generating a single conversation per instance (no upload).")
-        # Without a language filter, keep the original hand-picked indices for
-        # variety across the full corpus; with a filter, just take the first
-        # few rows of the (already language-scoped) corpus.
+        Logger.step("DEVELOPMENT run — generating conversations (no HF upload).")
         indices = [
-            # --- original smoke tests ---
-            234,   # English  | FM | user West accent | Neutral/Sad
-            0,     # Hinglish | FM | Normal           | Neutral/Neutral (baseline)
-            135,   # Hindi    | MM | user Bengali     | Neutral/Neutral
-            # --- Hindi (Devanagari + gender agreement + accents) ---
-            59,    # Hindi    | MF | Normal            | Neutral/Neutral (gender baseline)
-            3278,  # Hindi    | FM | Punjabi both      | Happy/Happy
-            6599,  # Hindi    | MM | Bengali both      | Angry/Sad (opposing emotion)
-            3235,  # Hindi    | FF | West/Bengali mix  | Happy/Angry (mixed accents)
-            # --- Hinglish (code-mixing + accents) ---
-            5,     # Hinglish | FM | Normal            | Neutral/Happy (baseline)
-            4921,  # Hinglish | FF | Gujarati both     | Sad/Sad
-            4751,  # Hinglish | MF | South Indian both | Angry/Neutral
-            # --- English (no Devanagari; lang-vs-accent tension) ---
-            2225,  # English  | MF | Normal            | Sad/Sad (pure emotional)
-            2882,  # English  | FM | West both         | Happy/Neutral
-            2563,  # English  | MM | Bengali/Punjabi   | Neutral/Angry (mixed accents)
+            234, 0, 135, 59, 3278, 6599, 3235, 5, 4921, 4751, 2225, 2882, 2563,
         ]
         max_conversations = 1
 
-    for i in indices:
-        row: dict[str, Any] = {str(k): v for k, v in corpus_df.iloc[i].to_dict().items()}
-        instance = CorpusInstance.from_dict(row)
-        # Production resume guard: an instance already abandoned (10 consecutive
-        # failures on a previous run) is recorded in skipped.json — pass over it
-        # instead of burning another 10 attempts on the same failing profile.
-        if skipped is not None and instance.corpus_combination_id in skipped:
-            Logger.warning(
-                f"Skipping instance {instance.corpus_combination_id} — "
-                f"already recorded in {BaseStorage.SKIPPED_NAME}."
-            )
-            continue
-        runner = _get_runner(runner_cache, args.model, args.validation_model, instance.language)
-        process_instance(runner, instance, storage, checkpoint, max_conversations, skipped)
+    corpus_target_sec = args.corpus_size * 60.0 if args.corpus_size else None
+    initial_sec = (
+        _initial_corpus_generated_sec(checkpoint, corpus_df) if corpus_target_sec else 0.0
+    )
+    corpus_budget: CorpusBudget | None = None
+    if corpus_target_sec is not None:
+        corpus_budget = CorpusBudget(corpus_target_sec, initial_sec)
+        Logger.step(
+            f"Corpus size cap: {args.corpus_size} min ({corpus_target_sec:.0f}s) — "
+            f"already generated {initial_sec / 60:.2f} min from checkpoint."
+        )
+        if production or args.corpus_size:
+            max_conversations = None
+
+    # Drop indices outside the filtered corpus (dev smoke list vs language filter).
+    indices = [i for i in indices if 0 <= i < len(corpus_df)]
+    if not indices:
+        Logger.error("No corpus indices to process.")
+        return
+
+    storage_lock = threading.Lock() if args.workers > 1 and storage is not None else None
+    worker_kwargs = dict(
+        corpus_df=corpus_df,
+        args=args,
+        storage=storage,
+        checkpoint=checkpoint,
+        skipped=skipped,
+        max_conversations=max_conversations,
+        corpus_budget=corpus_budget,
+        storage_lock=storage_lock,
+    )
+
+    if args.workers <= 1:
+        for i in indices:
+            if corpus_budget is not None and not corpus_budget.can_continue():
+                Logger.info("Corpus size target reached; stopping.")
+                break
+            _process_corpus_index(i, **worker_kwargs)
+    else:
+        Logger.step(f"Running {len(indices)} instance(s) with {args.workers} worker(s).")
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = [pool.submit(_process_corpus_index, i, **worker_kwargs) for i in indices]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as err:  # noqa: BLE001
+                    Logger.error(f"Worker failed: {err}")
+                if corpus_budget is not None and not corpus_budget.can_continue():
+                    Logger.info("Corpus size target reached; draining workers.")
+                    break
+
+    if corpus_budget is not None:
+        Logger.success(
+            f"Corpus progress: {corpus_budget.generated_sec / 60:.2f} / "
+            f"{args.corpus_size} min accepted.",
+            bold=True,
+        )
 
     Logger.divider()
     Logger.success("All requested instances processed.", bold=True)

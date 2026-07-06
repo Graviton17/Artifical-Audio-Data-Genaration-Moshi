@@ -233,6 +233,7 @@ class ConversationGeneratorAgent(BaseAgent):
 
     prompt_name = "conversation-generator-agent"
     temperature_key = "conversation"
+    agent_name = "conversation"
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
         super().__init__(llm)

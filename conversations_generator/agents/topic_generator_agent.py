@@ -28,6 +28,7 @@ class TopicGeneratorAgent(BaseAgent):
 
     prompt_name = "topic-generator-agent"
     temperature_key = "topic"
+    agent_name = "topic"
 
     def __init__(self, llm: BaseLLM | None = None) -> None:
         super().__init__(llm)
