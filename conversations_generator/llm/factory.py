@@ -8,16 +8,17 @@ Roles
 * **Generation** (``--model``): topic + conversation *content* only.
   ``--model`` always wins when given. Only when it's *omitted* does Hindi
   default to Sarvam (tuned for Indian languages); other languages default to
-  Krutrim in that case.
+  the self-hosted Gemma-4 (``gemma4_local``) in that case.
 * **Formatting + agent validation** (``--validation-model``): formatter agent
-  and LLM validator. Defaults to Gemma (Krutrim-hosted). Language routing does
-  **not** apply — validation stays on whatever ``--validation-model`` says.
+  and LLM validator. Defaults to the self-hosted Gemma-4 (``gemma4_local``).
+  Language routing does **not** apply — validation stays on whatever
+  ``--validation-model`` says.
 
     from conversations_generator.llm import LLMProvider, create_llm
 
     gen = create_llm(model="gemini", language="Hindi")      # -> GeminiLLM (explicit model wins)
     gen = create_llm(model=None, language="Hindi")          # -> SarvamLLM (default for Hindi)
-    val = create_llm(model="gemma", apply_language_routing=False)  # -> KrutrimLLM (Gemma)
+    val = create_llm(model=None, apply_language_routing=False)  # -> Gemma4LocalLLM (default)
 """
 
 from __future__ import annotations
@@ -28,6 +29,7 @@ from typing import Any
 from ..configuration_reader import get_model, get_temperature
 from .base_llm import BaseLLM
 from .gemini_llm import GeminiLLM
+from .gemma4_local_llm import Gemma4LocalLLM
 from .groq_llm import GroqLLM
 from .inception_llm import InceptionLLM
 from .krutrim_llm import KrutrimLLM
@@ -40,6 +42,7 @@ class LLMProvider(str, Enum):
 
     KRUTRIM = "krutrim"
     GEMMA = "gemma"  # Krutrim-hosted Gemma (default for --validation)
+    GEMMA4_LOCAL = "gemma4_local"  # self-hosted Gemma-4 llama-server via ngrok
     SARVAM = "sarvam"
     GEMINI = "gemini"
     GROQ = "groq"
@@ -54,6 +57,7 @@ class LLMProvider(str, Enum):
 _PROVIDER_CLASSES: dict[LLMProvider, type[BaseLLM]] = {
     LLMProvider.KRUTRIM: KrutrimLLM,
     LLMProvider.GEMMA: KrutrimLLM,
+    LLMProvider.GEMMA4_LOCAL: Gemma4LocalLLM,
     LLMProvider.SARVAM: SarvamLLM,
     LLMProvider.GEMINI: GeminiLLM,
     LLMProvider.GROQ: GroqLLM,
@@ -65,14 +69,15 @@ _PROVIDER_CLASSES: dict[LLMProvider, type[BaseLLM]] = {
 # *generation* only — Sarvam's models are purpose-built for Indian languages.
 _SARVAM_FORCED_LANGUAGES = {"hindi"}
 
-DEFAULT_GENERATION_PROVIDER = LLMProvider.KRUTRIM
-DEFAULT_VALIDATION_PROVIDER = LLMProvider.GEMMA
+DEFAULT_GENERATION_PROVIDER = LLMProvider.GEMMA4_LOCAL
+DEFAULT_VALIDATION_PROVIDER = LLMProvider.GEMMA4_LOCAL
 
 # Each provider class's own hard-coded default model, used as the fallback when
 # config.json's "MODELS" section has no entry for that provider.
 _FALLBACK_MODELS: dict[LLMProvider, str] = {
     LLMProvider.KRUTRIM: "gemma-4-26B-A4B-it",
     LLMProvider.GEMMA: "gemma-4-26B-A4B-it",
+    LLMProvider.GEMMA4_LOCAL: "gemma-4",
     LLMProvider.SARVAM: "sarvam-30b",
     LLMProvider.GEMINI: "gemini-3.5-flash",
     LLMProvider.GROQ: "llama-3.3-70b-versatile",

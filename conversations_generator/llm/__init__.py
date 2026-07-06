@@ -9,6 +9,7 @@ from .factory import (
     resolve_provider,
 )
 from .gemini_llm import GeminiLLM
+from .gemma4_local_llm import Gemma4LocalLLM
 from .groq_llm import GroqLLM
 from .inception_llm import InceptionLLM
 from .krutrim_llm import KrutrimLLM
@@ -26,6 +27,7 @@ __all__ = [
     "create_llm",
     "resolve_provider",
     "GeminiLLM",
+    "Gemma4LocalLLM",
     "GroqLLM",
     "InceptionLLM",
     "KrutrimLLM",

@@ -5,6 +5,8 @@
   "KRUTRIM_API_KEY": "your_krutrim_key",
   "OPENAI_API_KEY": "sk-proj-your_openai_key",
   "INCEPTION_API_KEY": "sk_your_inception_key",
+  "GEMMA4_LOCAL_API_KEY": "your_llama_server_bearer_token",
+  "GEMMA4_LOCAL_BASE_URL": "https://your-tunnel.ngrok-free.dev",
   "LANGFUSE_SECRET_KEY": "sk-lf-your_langfuse_secret",
   "LANGFUSE_PUBLIC_KEY": "pk-lf-your_langfuse_public",
   "LANGFUSE_BASE_URL": "https://jp.cloud.langfuse.com",
@@ -23,6 +25,7 @@
   "MODELS": {
     "krutrim": "gemma-4-26B-A4B-it",
     "gemma": "gemma-4-26B-A4B-it",
+    "gemma4_local": "gemma-4",
     "sarvam": "sarvam-30b",
     "gemini": "gemini-3.5-flash",
     "groq": "llama-3.3-70b-versatile",
