@@ -13,6 +13,7 @@ Bucket layout::
 
     hf://buckets/<ns>/<name>/
         checkpoint.json
+        skipped.json
         instance_0001/conversation_0001.json
         instance_0001/conversation_0002.json
         instance_0002/conversation_0001.json
@@ -30,6 +31,7 @@ from typing import Any
 from ..configuration_reader import get as config_get
 from .base_storage import BaseStorage, StorageError
 from .checkpoint import Checkpoint
+from .skipped import SkippedRegistry
 
 try:  # Lazy-ish import so the package works without the SDK installed.
     from huggingface_hub import (
@@ -171,3 +173,27 @@ class HuggingFaceStorage(BaseStorage):
 
     def save_checkpoint(self, checkpoint: Checkpoint) -> None:
         self._upload_json(self.CHECKPOINT_NAME, checkpoint.to_dict())
+
+    # ------------------------------------------------------------------ #
+    # Skipped registry
+    # ------------------------------------------------------------------ #
+    def load_skipped(self) -> SkippedRegistry:
+        local = self._tmp / self.SKIPPED_NAME
+        try:
+            download_bucket_files(
+                self.bucket_id,
+                files=[(self.SKIPPED_NAME, str(local))],
+            )
+        except Exception as err:  # noqa: BLE001
+            if any(hint in str(err).lower() for hint in _NOT_FOUND_HINTS):
+                return SkippedRegistry()  # first run — nothing skipped yet
+            raise StorageError(f"Failed to read skipped registry: {err}") from err
+
+        if not local.exists():
+            # Some backends silently skip a missing file instead of raising.
+            return SkippedRegistry()
+        with open(local, "r", encoding="utf-8") as f:
+            return SkippedRegistry.from_dict(json.load(f))
+
+    def save_skipped(self, skipped: SkippedRegistry) -> None:
+        self._upload_json(self.SKIPPED_NAME, skipped.to_dict())

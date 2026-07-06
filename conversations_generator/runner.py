@@ -71,7 +71,15 @@ from .llm import (
 from .loaders import read_corpus_instances
 from .logger import Logger
 from .models import CorpusInstance
-from .storage import BaseStorage, Checkpoint, HuggingFaceStorage, InstanceProgress, StorageError
+from .storage import (
+    BaseStorage,
+    Checkpoint,
+    HuggingFaceStorage,
+    InstanceProgress,
+    SkippedInstance,
+    SkippedRegistry,
+    StorageError,
+)
 
 # Corpus languages selectable via --language, mapped case-insensitively onto
 # the corpus's actual casing ("Hindi" / "Hinglish" / "English").
@@ -1006,6 +1014,7 @@ def process_instance(
     storage: BaseStorage | None = None,
     checkpoint: Checkpoint | None = None,
     max_conversations: int | None = None,
+    skipped: SkippedRegistry | None = None,
 ) -> float:
     """Generate conversations for one instance until its target duration is met.
 
@@ -1026,6 +1035,11 @@ def process_instance(
     ``max_conversations`` caps how many conversations are accepted this run,
     regardless of the duration target — used in development to stop after a
     single conversation instead of chasing the full multi-hour target.
+
+    ``skipped`` (production only) is the bucket-root registry of instances
+    abandoned after ``MAX_CONSECUTIVE_FAILURES`` consecutive validation failures.
+    When this instance hits that limit, it's recorded there and ``skipped.json``
+    is re-uploaded, so a resuming machine passes over it instead of retrying it.
     """
     target_sec = instance.duration_sec or 0.0
 
@@ -1079,6 +1093,34 @@ def process_instance(
                     f"Aborting instance {instance.corpus_combination_id}: "
                     f"{MAX_CONSECUTIVE_FAILURES} consecutive failures."
                 )
+                # Production only: record the abandoned instance in the bucket's
+                # root skipped.json so it's audited and skipped on resume instead
+                # of burning another 10 attempts on it. Best-effort — a storage
+                # failure here must not crash the whole run.
+                if storage is not None and skipped is not None:
+                    try:
+                        skipped.add(
+                            SkippedInstance(
+                                corpus_combination_id=instance.corpus_combination_id,
+                                consecutive_failures=consecutive_failures,
+                                reason=f"{MAX_CONSECUTIVE_FAILURES} consecutive validation failures",
+                                generated_sec=progress.generated_sec,
+                                target_sec=target_sec,
+                                conversation_count=progress.conversation_count,
+                                language=instance.language,
+                                gender_pair=instance.gender_pair,
+                            )
+                        )
+                        storage.save_skipped(skipped)
+                        Logger.warning(
+                            f"Recorded instance {instance.corpus_combination_id} in "
+                            f"{storage.SKIPPED_NAME} (bucket root)."
+                        )
+                    except StorageError as err:
+                        Logger.error(
+                            f"Failed to record skipped instance "
+                            f"{instance.corpus_combination_id}: {err}"
+                        )
                 break
             continue
 
@@ -1269,6 +1311,7 @@ def main(argv: list[str] | None = None) -> None:
     # Storage + checkpoint are production-only. Dev runs entirely in memory.
     storage: BaseStorage | None = None
     checkpoint: Checkpoint | None = None
+    skipped: SkippedRegistry | None = None
     # In development, cap at a single conversation per instance; production
     # chases each instance's full duration target.
     max_conversations: int | None = None
@@ -1277,6 +1320,10 @@ def main(argv: list[str] | None = None) -> None:
         storage = HuggingFaceStorage()
         checkpoint = storage.load_checkpoint()
         Logger.info(f"Loaded checkpoint with {len(checkpoint.instances)} instance record(s).")
+        skipped = storage.load_skipped()
+        Logger.info(
+            f"Loaded skipped registry with {len(skipped.instances)} abandoned instance(s)."
+        )
         indices = range(len(corpus_df))
     else:
         Logger.step("DEVELOPMENT run — generating a single conversation per instance (no upload).")
@@ -1307,8 +1354,17 @@ def main(argv: list[str] | None = None) -> None:
     for i in indices:
         row: dict[str, Any] = {str(k): v for k, v in corpus_df.iloc[i].to_dict().items()}
         instance = CorpusInstance.from_dict(row)
+        # Production resume guard: an instance already abandoned (10 consecutive
+        # failures on a previous run) is recorded in skipped.json — pass over it
+        # instead of burning another 10 attempts on the same failing profile.
+        if skipped is not None and instance.corpus_combination_id in skipped:
+            Logger.warning(
+                f"Skipping instance {instance.corpus_combination_id} — "
+                f"already recorded in {BaseStorage.SKIPPED_NAME}."
+            )
+            continue
         runner = _get_runner(runner_cache, args.model, args.validation_model, instance.language)
-        process_instance(runner, instance, storage, checkpoint, max_conversations)
+        process_instance(runner, instance, storage, checkpoint, max_conversations, skipped)
 
     Logger.divider()
     Logger.success("All requested instances processed.", bold=True)
