@@ -158,6 +158,29 @@ def get_model(provider: str, default: str) -> str:
     return str(value) if value else default
 
 
+def get_provider_pricing(provider: str) -> dict[str, Any] | None:
+    """Return pricing dict for a provider from ``MODEL_PRICING``, or ``None``."""
+    table = get_raw("MODEL_PRICING", {})
+    if not isinstance(table, dict):
+        return None
+    entry = table.get(provider.strip().lower())
+    if not isinstance(entry, dict) or not entry:
+        return None
+    return entry
+
+
+def build_model_to_provider_map() -> dict[str, str]:
+    """Map configured model ids back to provider keys (for cost attribution)."""
+    models = get_raw("MODELS", {})
+    if not isinstance(models, dict):
+        return {}
+    return {
+        str(model_id): str(provider).lower()
+        for provider, model_id in models.items()
+        if model_id
+    }
+
+
 def get(key: str, default: str | None = None) -> str | None:
     """Return ``key`` from config, or ``default`` if missing / empty."""
     cfg = load_config()

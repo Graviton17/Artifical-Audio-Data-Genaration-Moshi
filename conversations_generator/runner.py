@@ -22,8 +22,10 @@ by regenerating the transcript; formatting problems are fixed by re-formatting.
 ``--corpus-size`` caps total generated audio duration (minutes) for the filtered
 language(s). Generation stops once accepted conversations reach that total.
 
-``--workers`` runs up to N instances in parallel (1–10). Each worker maintains
-its own LLM clients; checkpoint updates are serialized.
+    python -m conversations_generator.runner --tokenstats --language=english
+
+``--tokenstats`` scans the HuggingFace bucket and prints input/output token
+summaries from stored conversation JSON (no generation run).
 
 ``--model`` is **generation only** (topic + conversation transcript) and always
 wins when given, for any language. Only when it's *omitted* does Hindi default
@@ -42,6 +44,7 @@ import random
 import threading
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -82,6 +85,13 @@ from .loaders import read_corpus_instances
 from .logger import Logger
 from .models import CorpusInstance
 from .usage_tracker import UsageTracker, usage_context
+from .token_stats import (
+    ModelInfo,
+    legacy_krutrim_models,
+    models_metadata_lines,
+    patch_hf_model_metadata,
+    print_token_stats,
+)
 from .storage import (
     BaseStorage,
     Checkpoint,
@@ -918,10 +928,16 @@ MAX_CONSECUTIVE_FAILURES = 10
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 
 
-def _conversation_payload(instance: CorpusInstance, index: int, result: dict[str, Any]) -> dict[str, Any]:
+def _conversation_payload(
+    instance: CorpusInstance,
+    index: int,
+    result: dict[str, Any],
+    *,
+    models: ModelInfo | None = None,
+) -> dict[str, Any]:
     """Build the JSON body stored for one accepted conversation."""
     manual_report = result.get("manual_validation")
-    return {
+    payload: dict[str, Any] = {
         "corpus_combination_id": instance.corpus_combination_id,
         "index": index,
         "profile": instance.to_profile(),
@@ -932,6 +948,10 @@ def _conversation_payload(instance: CorpusInstance, index: int, result: dict[str
         "turns": result.get("turns", []),
         "usage": result.get("usage"),
     }
+    model_data = models.to_dict() if models else result.get("models")
+    if model_data:
+        payload["models"] = model_data
+    return payload
 
 
 def _turn_type_counts(turns: list[dict[str, Any]]) -> dict[str, int]:
@@ -987,6 +1007,12 @@ def _build_metadata_text(
         f"agent_accent: {profile.get('agent_accent', '')}",
         f"user_accent: {profile.get('user_accent', '')}",
         "",
+    ]
+    models = result.get("models")
+    if models:
+        lines += models_metadata_lines(models)
+
+    lines += [
         "## Duration",
         f"duration_sec: {duration}",
         f"duration_min: {round(duration / 60, 2) if duration else None}",
@@ -1096,6 +1122,8 @@ def save_local_output(
     index: int,
     result: dict[str, Any],
     output_dir: Path | None = None,
+    *,
+    models: ModelInfo | None = None,
 ) -> Path:
     """Write an accepted conversation under ``output/<run_id>/``.
 
@@ -1111,10 +1139,12 @@ def save_local_output(
     run_dir = root / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    payload = _conversation_payload(instance, index, result)
+    payload = _conversation_payload(instance, index, result, models=models)
     payload["run_id"] = run_id
     payload["target_duration_sec"] = result.get("target_duration_sec")
     payload["transcript"] = result.get("transcript") or ""
+    if models:
+        result["models"] = models.to_dict()
 
     json_path = run_dir / "conversation.json"
     json_path.write_text(
@@ -1139,11 +1169,12 @@ def process_instance(
     runner: ConversationRunner,
     instance: CorpusInstance,
     storage: BaseStorage | None = None,
-    checkpoint: Checkpoint | None = None,
+    checkpoint_caches: dict[str, Checkpoint] | None = None,
+    skipped_caches: dict[str, SkippedRegistry] | None = None,
     max_conversations: int | None = None,
-    skipped: SkippedRegistry | None = None,
     corpus_budget: CorpusBudget | None = None,
     storage_lock: threading.Lock | None = None,
+    models: ModelInfo | None = None,
 ) -> float:
     """Generate conversations for one instance until its target duration is met.
 
@@ -1156,25 +1187,38 @@ def process_instance(
 
     * ``storage=None`` (development): nothing is uploaded — conversations are
       generated and counted in memory only.
-    * ``storage`` provided (production): progress is resumed from ``checkpoint``,
-      each accepted conversation is uploaded to its instance folder in the
-      bucket, and the root ``checkpoint.json`` is updated afterwards, so a crash
-      loses at most the one conversation in flight.
+    * ``storage`` provided (production): progress is resumed from the language
+      folder's ``checkpoint.json``, each accepted conversation is uploaded under
+      ``<language>/instance_<id>/conversation_<n>/``, and the checkpoint is
+      updated afterwards, so a crash loses at most the one conversation in flight.
 
     ``max_conversations`` caps how many conversations are accepted this run,
     regardless of the duration target — used in development to stop after a
     single conversation instead of chasing the full multi-hour target.
 
-    ``skipped`` (production only) is the bucket-root registry of instances
+    ``skipped`` (production only) is the per-language registry of instances
     abandoned after ``MAX_CONSECUTIVE_FAILURES`` consecutive validation failures.
-    When this instance hits that limit, it's recorded there and ``skipped.json``
-    is re-uploaded, so a resuming machine passes over it instead of retrying it.
     """
     target_sec = instance.duration_sec or 0.0
+    lang_key = BaseStorage.normalize_language(instance.language)
+
+    checkpoint: Checkpoint | None = None
+    skipped: SkippedRegistry | None = None
+    if storage is not None:
+        lock = storage_lock or threading.Lock()
+        with lock:
+            if checkpoint_caches is not None:
+                if lang_key not in checkpoint_caches:
+                    checkpoint_caches[lang_key] = storage.load_checkpoint(instance.language)
+                checkpoint = checkpoint_caches[lang_key]
+            if skipped_caches is not None:
+                if lang_key not in skipped_caches:
+                    skipped_caches[lang_key] = storage.load_skipped(instance.language)
+                skipped = skipped_caches[lang_key]
 
     # In dev (no storage) progress lives only in this local record; in prod it's
     # the shared, resumable checkpoint entry for this instance.
-    if storage is not None and checkpoint is not None:
+    if checkpoint is not None:
         progress = checkpoint.get(instance.corpus_combination_id, target_sec)
     else:
         progress = InstanceProgress(instance.corpus_combination_id, target_sec)
@@ -1214,6 +1258,8 @@ def process_instance(
         )
 
         result = runner.run(**instance.to_profile())
+        if models:
+            result["models"] = models.to_dict()
         manual_report = result.get("manual_validation")
         duration = getattr(manual_report, "duration_sec", None)
 
@@ -1248,10 +1294,10 @@ def process_instance(
                                     gender_pair=instance.gender_pair,
                                 )
                             )
-                            storage.save_skipped(skipped)
+                            storage.save_skipped(skipped, instance.language)
                         Logger.warning(
                             f"Recorded instance {instance.corpus_combination_id} in "
-                            f"{storage.SKIPPED_NAME} (bucket root)."
+                            f"{lang_key}/{BaseStorage.SKIPPED_NAME}."
                         )
                     except StorageError as err:
                         Logger.error(
@@ -1267,7 +1313,7 @@ def process_instance(
         # Always dump accepted conversations under output/<run_id>/ so the JSON
         # (and a metadata sidecar) is available locally regardless of MODE.
         try:
-            local_dir = save_local_output(instance, index, result)
+            local_dir = save_local_output(instance, index, result, models=models)
             Logger.success(f"Wrote local output → {local_dir}")
         except OSError as err:
             Logger.warning(f"Failed to write local output for conversation {index}: {err}")
@@ -1290,12 +1336,13 @@ def process_instance(
                     path = storage.save_conversation(
                         instance.corpus_combination_id,
                         index,
-                        _conversation_payload(instance, index, result),
+                        _conversation_payload(instance, index, result, models=models),
+                        language=instance.language,
                         metadata_text=metadata_text,
                         transcript_text=transcript_text or None,
                     )
                     checkpoint.record(progress, duration)
-                    storage.save_checkpoint(checkpoint)
+                    storage.save_checkpoint(checkpoint, instance.language)
                     if corpus_budget is not None:
                         corpus_budget.add(duration)
             except StorageError as err:
@@ -1382,15 +1429,48 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "language(s) reaches this many minutes."
         ),
     )
+    parser.add_argument(
+        "--tokenstats",
+        action="store_true",
+        help=(
+            "Print input/output token usage and cost summary from conversations "
+            "stored in the HuggingFace bucket, then exit."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-cache",
+        action="store_true",
+        help="With --tokenstats, re-download all conversation JSON from HF (ignore local cache).",
+    )
     return parser.parse_args(argv)
 
 
+@dataclass(frozen=True)
+class RunnerHandle:
+    """Runner plus the generation/validation providers used for this invocation."""
+
+    runner: ConversationRunner
+    generation_provider: str
+    generation_model: str
+    validation_provider: str
+    validation_model: str
+
+    @property
+    def models(self) -> ModelInfo:
+        return ModelInfo(
+            generation_provider=self.generation_provider,
+            generation_model=self.generation_model,
+            validation_provider=self.validation_provider,
+            validation_model=self.validation_model,
+        )
+
+
 def _get_runner(
-    runner_cache: dict[tuple[LLMProvider, LLMProvider], "ConversationRunner"],
+    runner_cache: dict[tuple[LLMProvider, LLMProvider], RunnerHandle],
     model: str | None,
     validation: str | None,
     language: str | None,
-) -> "ConversationRunner":
+) -> RunnerHandle:
     """Return the (cached) runner for this instance's generation + validation providers.
 
     Generation resolves per-instance, but an explicit ``model`` always wins —
@@ -1429,11 +1509,17 @@ def _get_runner(
             f"validation/formatter model='{validation_llm.model}' (temperature={validation_llm.temperature}) "
             "— both configurable via conversations_generator/config.json ('MODELS' / 'TEMPERATURE')."
         )
-        runner_cache[cache_key] = ConversationRunner(
-            llm=generation_llm,
-            validation_llm=validation_llm,
-            max_generation_attempts=3,
-            max_format_attempts=3,
+        runner_cache[cache_key] = RunnerHandle(
+            runner=ConversationRunner(
+                llm=generation_llm,
+                validation_llm=validation_llm,
+                max_generation_attempts=3,
+                max_format_attempts=3,
+            ),
+            generation_provider=generation_provider.value,
+            generation_model=generation_llm.model,
+            validation_provider=validation_provider.value,
+            validation_model=validation_llm.model,
         )
     return runner_cache[cache_key]
 
@@ -1441,7 +1527,7 @@ def _get_runner(
 _thread_local = threading.local()
 
 
-def _thread_runner_cache() -> dict[tuple[LLMProvider, LLMProvider], ConversationRunner]:
+def _thread_runner_cache() -> dict[tuple[LLMProvider, LLMProvider], RunnerHandle]:
     cache = getattr(_thread_local, "runner_cache", None)
     if cache is None:
         cache = {}
@@ -1450,17 +1536,26 @@ def _thread_runner_cache() -> dict[tuple[LLMProvider, LLMProvider], Conversation
 
 
 def _initial_corpus_generated_sec(
-    checkpoint: Checkpoint | None,
+    storage: BaseStorage | None,
     corpus_df: Any,
+    *,
+    language: str | None = None,
 ) -> float:
     """Sum accepted duration already recorded for instances in this run scope."""
-    if checkpoint is None:
+    if storage is None:
         return 0.0
     ids = set(corpus_df["corpus_combination_id"].tolist())
     total = 0.0
-    for prog in checkpoint.instances.values():
-        if prog.corpus_combination_id in ids:
-            total += prog.generated_sec
+    languages = (
+        [BaseStorage.normalize_language(language)]
+        if language
+        else corpus_df["language"].str.lower().unique().tolist()
+    )
+    for lang in languages:
+        checkpoint = storage.load_checkpoint(lang)
+        for prog in checkpoint.instances.values():
+            if prog.corpus_combination_id in ids:
+                total += prog.generated_sec
     return total
 
 
@@ -1470,8 +1565,8 @@ def _process_corpus_index(
     args: argparse.Namespace,
     *,
     storage: BaseStorage | None,
-    checkpoint: Checkpoint | None,
-    skipped: SkippedRegistry | None,
+    checkpoint_caches: dict[str, Checkpoint] | None,
+    skipped_caches: dict[str, SkippedRegistry] | None,
     max_conversations: int | None,
     corpus_budget: CorpusBudget | None,
     storage_lock: threading.Lock | None,
@@ -1482,11 +1577,20 @@ def _process_corpus_index(
 
     row: dict[str, Any] = {str(k): v for k, v in corpus_df.iloc[index].to_dict().items()}
     instance = CorpusInstance.from_dict(row)
+    lang_key = BaseStorage.normalize_language(instance.language)
+
+    skipped: SkippedRegistry | None = None
+    if storage is not None and skipped_caches is not None:
+        lock = storage_lock or threading.Lock()
+        with lock:
+            if lang_key not in skipped_caches:
+                skipped_caches[lang_key] = storage.load_skipped(instance.language)
+            skipped = skipped_caches[lang_key]
 
     if skipped is not None and instance.corpus_combination_id in skipped:
         Logger.warning(
             f"Skipping instance {instance.corpus_combination_id} — "
-            f"already recorded in {BaseStorage.SKIPPED_NAME}."
+            f"already recorded in {lang_key}/{BaseStorage.SKIPPED_NAME}."
         )
         return 0.0
 
@@ -1497,14 +1601,15 @@ def _process_corpus_index(
         instance.language,
     )
     return process_instance(
-        runner,
+        runner.runner,
         instance,
         storage,
-        checkpoint,
+        checkpoint_caches,
+        skipped_caches,
         max_conversations,
-        skipped,
         corpus_budget,
         storage_lock,
+        models=runner.models,
     )
 
 
@@ -1513,6 +1618,11 @@ def main(argv: list[str] | None = None) -> None:
     # mirror them into os.environ for any third-party SDK that only reads env.
     apply_to_environ()
     args = _parse_args(argv)
+
+    if args.tokenstats:
+        Logger.step("Loading token usage from HuggingFace bucket...")
+        print_token_stats(language=args.language, refresh=args.refresh_cache)
+        return
 
     # ``MODE=prod`` (config.json) processes every corpus instance in sequence and
     # uploads to HuggingFace; anything else is development — local prompts, local
@@ -1544,22 +1654,21 @@ def main(argv: list[str] | None = None) -> None:
     )
     Logger.info(f"Parallel workers: {args.workers}")
 
-    # Storage + checkpoint are production-only. Dev runs entirely in memory.
+    # Storage is production-only. Checkpoints/skipped are loaded per language.
     storage: BaseStorage | None = None
-    checkpoint: Checkpoint | None = None
-    skipped: SkippedRegistry | None = None
+    checkpoint_caches: dict[str, Checkpoint] | None = None
+    skipped_caches: dict[str, SkippedRegistry] | None = None
     # In development, cap at a single conversation per instance; production
     # chases each instance's full duration target (unless --corpus-size is set).
     max_conversations: int | None = None
     if production:
-        Logger.step(f"PRODUCTION run — processing all {len(corpus_df)} instances.")
-        storage = HuggingFaceStorage()
-        checkpoint = storage.load_checkpoint()
-        Logger.info(f"Loaded checkpoint with {len(checkpoint.instances)} instance record(s).")
-        skipped = storage.load_skipped()
-        Logger.info(
-            f"Loaded skipped registry with {len(skipped.instances)} abandoned instance(s)."
+        Logger.step(
+            f"PRODUCTION run — processing all {len(corpus_df)} instances "
+            f"(bucket layout: <language>/instance_<id>/conversation_<n>/)."
         )
+        storage = HuggingFaceStorage()
+        checkpoint_caches = {}
+        skipped_caches = {}
         indices = list(range(len(corpus_df)))
     else:
         Logger.step("DEVELOPMENT run — generating conversations (no HF upload).")
@@ -1570,7 +1679,11 @@ def main(argv: list[str] | None = None) -> None:
 
     corpus_target_sec = args.corpus_size * 60.0 if args.corpus_size else None
     initial_sec = (
-        _initial_corpus_generated_sec(checkpoint, corpus_df) if corpus_target_sec else 0.0
+        _initial_corpus_generated_sec(
+            storage, corpus_df, language=args.language
+        )
+        if corpus_target_sec
+        else 0.0
     )
     corpus_budget: CorpusBudget | None = None
     if corpus_target_sec is not None:
@@ -1593,8 +1706,8 @@ def main(argv: list[str] | None = None) -> None:
         corpus_df=corpus_df,
         args=args,
         storage=storage,
-        checkpoint=checkpoint,
-        skipped=skipped,
+        checkpoint_caches=checkpoint_caches,
+        skipped_caches=skipped_caches,
         max_conversations=max_conversations,
         corpus_budget=corpus_budget,
         storage_lock=storage_lock,

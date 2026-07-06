@@ -143,3 +143,9 @@ python -m conversations_generator.runner \
   --workers=3 \
   --model=krutrim \
   --validation-model=krutrim
+
+# English only
+python -m conversations_generator.runner --tokenstats --language=english
+
+# All languages in bucket (english + hinglish + hindi when present)
+python -m conversations_generator.runner --tokenstats

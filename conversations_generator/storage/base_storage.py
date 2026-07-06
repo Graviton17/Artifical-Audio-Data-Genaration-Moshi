@@ -8,11 +8,19 @@ same way agents depend only on ``BaseLLM``.
 Layout contract every backend must honor::
 
     <bucket root>/
-        checkpoint.json                     # resume state (root level)
-        skipped.json                         # instances abandoned after N failures
-        instance_<id>/                       # one folder per corpus instance
-            conversation_0001.json
-            conversation_0002.json
+        english/                             # one folder per corpus language
+            checkpoint.json                  # resume state for this language
+            skipped.json                     # abandoned instances (this language)
+            instance_<id>/
+                conversation_0001/
+                    conversation.json
+                    metadata.txt
+                    transcript.txt
+                conversation_0002/
+                    ...
+        hinglish/
+            ...
+        hindi/
             ...
 """
 
@@ -24,6 +32,8 @@ from typing import Any
 from .checkpoint import Checkpoint
 from .skipped import SkippedRegistry
 
+SUPPORTED_LANGUAGE_FOLDERS = ("english", "hinglish", "hindi")
+
 
 class StorageError(RuntimeError):
     """Raised when a storage backend operation fails."""
@@ -32,11 +42,20 @@ class StorageError(RuntimeError):
 class BaseStorage(ABC):
     """Base class for conversation + checkpoint storage backends."""
 
-    #: File name of the resume state at the bucket root.
+    #: File name of the resume state inside each language folder.
     CHECKPOINT_NAME = "checkpoint.json"
 
-    #: File name of the abandoned-instance registry at the bucket root.
+    #: File name of the abandoned-instance registry inside each language folder.
     SKIPPED_NAME = "skipped.json"
+
+    @staticmethod
+    def normalize_language(language: str) -> str:
+        """Map corpus language labels to bucket folder names."""
+        return language.strip().lower()
+
+    @staticmethod
+    def language_root(language: str) -> str:
+        return BaseStorage.normalize_language(language)
 
     @staticmethod
     def instance_folder(corpus_combination_id: int) -> str:
@@ -44,9 +63,28 @@ class BaseStorage(ABC):
         return f"instance_{corpus_combination_id:04d}"
 
     @staticmethod
+    def conversation_folder(index: int) -> str:
+        """Folder name for one conversation's artifacts."""
+        return f"conversation_{index:04d}"
+
+    @staticmethod
     def conversation_name(index: int) -> str:
-        """File name (within an instance folder) for one conversation."""
+        """Legacy helper — JSON file name (prefer :meth:`conversation_folder`)."""
         return f"conversation_{index:04d}.json"
+
+    @classmethod
+    def conversation_base(
+        cls,
+        language: str,
+        corpus_combination_id: int,
+        index: int,
+    ) -> str:
+        """Prefix path for one conversation directory (no trailing file)."""
+        return (
+            f"{cls.language_root(language)}/"
+            f"{cls.instance_folder(corpus_combination_id)}/"
+            f"{cls.conversation_folder(index)}"
+        )
 
     # ------------------------------------------------------------------ #
     # Subclass contract
@@ -58,6 +96,7 @@ class BaseStorage(ABC):
         index: int,
         payload: dict[str, Any],
         *,
+        language: str,
         metadata_text: str | None = None,
         transcript_text: str | None = None,
     ) -> str:
@@ -68,21 +107,21 @@ class BaseStorage(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def load_checkpoint(self) -> Checkpoint:
-        """Read the root ``checkpoint.json``; return an empty one if absent."""
+    def load_checkpoint(self, language: str) -> Checkpoint:
+        """Read ``<language>/checkpoint.json``; return an empty one if absent."""
         raise NotImplementedError
 
     @abstractmethod
-    def save_checkpoint(self, checkpoint: Checkpoint) -> None:
-        """Write the root ``checkpoint.json`` (overwriting any prior state)."""
+    def save_checkpoint(self, checkpoint: Checkpoint, language: str) -> None:
+        """Write ``<language>/checkpoint.json`` (overwriting any prior state)."""
         raise NotImplementedError
 
     @abstractmethod
-    def load_skipped(self) -> SkippedRegistry:
-        """Read the root ``skipped.json``; return an empty registry if absent."""
+    def load_skipped(self, language: str) -> SkippedRegistry:
+        """Read ``<language>/skipped.json``; return an empty registry if absent."""
         raise NotImplementedError
 
     @abstractmethod
-    def save_skipped(self, skipped: SkippedRegistry) -> None:
-        """Write the root ``skipped.json`` (overwriting any prior state)."""
+    def save_skipped(self, skipped: SkippedRegistry, language: str) -> None:
+        """Write ``<language>/skipped.json`` (overwriting any prior state)."""
         raise NotImplementedError

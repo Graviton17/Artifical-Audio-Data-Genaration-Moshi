@@ -12,12 +12,18 @@ full ``hf://buckets/ns/name`` form and the short ``ns/name`` form are accepted.
 Bucket layout::
 
     hf://buckets/<ns>/<name>/
-        checkpoint.json
-        skipped.json
-        instance_0001/conversation_0001.json
-        instance_0001/conversation_0002.json
-        instance_0002/conversation_0001.json
-        ...
+        english/
+            checkpoint.json
+            skipped.json
+            instance_0001/
+                conversation_0001/
+                    conversation.json
+                    metadata.txt
+                    transcript.txt
+        hinglish/
+            ...
+        hindi/
+            ...
 """
 
 from __future__ import annotations
@@ -73,7 +79,7 @@ class HuggingFaceStorage(BaseStorage):
             raise StorageError(
                 "No HuggingFace bucket configured. Pass bucket= or set HF_BUCKET "
                 "in conversations_generator/config.json "
-                "(e.g. 'hf://buckets/Graviton17/artificial-data-conversation')."
+                "(e.g. 'hf://buckets/inavlabs/kupe-fdx-text-data')."
             )
         # The bucket API takes the short 'namespace/name' form; accept either.
         self.bucket_id = raw.removeprefix(_BUCKET_PREFIX).strip("/")
@@ -95,6 +101,17 @@ class HuggingFaceStorage(BaseStorage):
             self._ensure_bucket(private)
 
     # ------------------------------------------------------------------ #
+    # Path helpers
+    # ------------------------------------------------------------------ #
+    @classmethod
+    def _checkpoint_path(cls, language: str) -> str:
+        return f"{cls.language_root(language)}/{cls.CHECKPOINT_NAME}"
+
+    @classmethod
+    def _skipped_path(cls, language: str) -> str:
+        return f"{cls.language_root(language)}/{cls.SKIPPED_NAME}"
+
+    # ------------------------------------------------------------------ #
     # Bucket lifecycle
     # ------------------------------------------------------------------ #
     def _ensure_bucket(self, private: bool) -> None:
@@ -113,6 +130,7 @@ class HuggingFaceStorage(BaseStorage):
     def _upload_json(self, path_in_bucket: str, payload: dict[str, Any]) -> None:
         """Write ``payload`` to a temp file and upload it to ``path_in_bucket``."""
         local = self._tmp / path_in_bucket.replace("/", "__")
+        local.parent.mkdir(parents=True, exist_ok=True)
         local.write_text(
             json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
         )
@@ -126,6 +144,7 @@ class HuggingFaceStorage(BaseStorage):
     def _upload_text(self, path_in_bucket: str, text: str) -> None:
         """Upload a plain-text file to ``path_in_bucket``."""
         local = self._tmp / path_in_bucket.replace("/", "__")
+        local.parent.mkdir(parents=True, exist_ok=True)
         local.write_text(text, encoding="utf-8")
         try:
             batch_bucket_files(self.bucket_id, add=[(str(local), path_in_bucket)])
@@ -143,87 +162,79 @@ class HuggingFaceStorage(BaseStorage):
         index: int,
         payload: dict[str, Any],
         *,
+        language: str,
         metadata_text: str | None = None,
         transcript_text: str | None = None,
     ) -> str:
-        folder = self.instance_folder(corpus_combination_id)
-        path_in_bucket = f"{folder}/{self.conversation_name(index)}"
+        base = self.conversation_base(language, corpus_combination_id, index)
+        path_in_bucket = f"{base}/conversation.json"
         self._upload_json(path_in_bucket, payload)
 
-        base = f"{folder}/conversation_{index:04d}"
         if metadata_text is not None:
-            self._upload_text(f"{base}_metadata.txt", metadata_text)
+            self._upload_text(f"{base}/metadata.txt", metadata_text)
         if transcript_text:
-            self._upload_text(f"{base}_transcript.txt", transcript_text)
+            self._upload_text(f"{base}/transcript.txt", transcript_text)
 
         return f"{_BUCKET_PREFIX}{self.bucket_id}/{path_in_bucket}"
 
     # ------------------------------------------------------------------ #
     # Checkpoint
     # ------------------------------------------------------------------ #
-    def load_checkpoint(self) -> Checkpoint:
-        local = self._tmp / self.CHECKPOINT_NAME
+    def load_checkpoint(self, language: str) -> Checkpoint:
+        path = self._checkpoint_path(language)
+        local = self._tmp / path.replace("/", "__")
         try:
             download_bucket_files(
                 self.bucket_id,
-                files=[(self.CHECKPOINT_NAME, str(local))],
+                files=[(path, str(local))],
             )
         except Exception as err:  # noqa: BLE001
             if any(hint in str(err).lower() for hint in _NOT_FOUND_HINTS):
-                return self._init_checkpoint()  # first run — no checkpoint yet
+                return self._init_checkpoint(language)  # first run — no checkpoint yet
             raise StorageError(f"Failed to read checkpoint: {err}") from err
 
         if not local.exists():
             # Some backends silently skip a missing file instead of raising.
-            return self._init_checkpoint()
+            return self._init_checkpoint(language)
         with open(local, "r", encoding="utf-8") as f:
             return Checkpoint.from_dict(json.load(f))
 
-    def _init_checkpoint(self) -> Checkpoint:
-        """First-run bootstrap: create an empty checkpoint and upload it.
-
-        Writing it back immediately means the bucket always has a
-        ``checkpoint.json`` after the first run, so subsequent machines take the
-        normal resume path instead of re-detecting a missing file.
-        """
+    def _init_checkpoint(self, language: str) -> Checkpoint:
+        """First-run bootstrap: create an empty checkpoint and upload it."""
         checkpoint = Checkpoint()
-        self.save_checkpoint(checkpoint)
+        self.save_checkpoint(checkpoint, language)
         return checkpoint
 
-    def save_checkpoint(self, checkpoint: Checkpoint) -> None:
-        self._upload_json(self.CHECKPOINT_NAME, checkpoint.to_dict())
+    def save_checkpoint(self, checkpoint: Checkpoint, language: str) -> None:
+        self._upload_json(self._checkpoint_path(language), checkpoint.to_dict())
 
     # ------------------------------------------------------------------ #
     # Skipped registry
     # ------------------------------------------------------------------ #
-    def load_skipped(self) -> SkippedRegistry:
-        local = self._tmp / self.SKIPPED_NAME
+    def load_skipped(self, language: str) -> SkippedRegistry:
+        path = self._skipped_path(language)
+        local = self._tmp / path.replace("/", "__")
         try:
             download_bucket_files(
                 self.bucket_id,
-                files=[(self.SKIPPED_NAME, str(local))],
+                files=[(path, str(local))],
             )
         except Exception as err:  # noqa: BLE001
             if any(hint in str(err).lower() for hint in _NOT_FOUND_HINTS):
-                return self._init_skipped()  # first run — no registry yet
+                return self._init_skipped(language)  # first run — no registry yet
             raise StorageError(f"Failed to read skipped registry: {err}") from err
 
         if not local.exists():
             # Some backends silently skip a missing file instead of raising.
-            return self._init_skipped()
+            return self._init_skipped(language)
         with open(local, "r", encoding="utf-8") as f:
             return SkippedRegistry.from_dict(json.load(f))
 
-    def _init_skipped(self) -> SkippedRegistry:
-        """First-run bootstrap: create an empty skipped registry and upload it.
-
-        Writing it back immediately means the bucket always has a
-        ``skipped.json`` after the first run, so subsequent machines take the
-        normal read path instead of re-detecting a missing file.
-        """
+    def _init_skipped(self, language: str) -> SkippedRegistry:
+        """First-run bootstrap: create an empty skipped registry and upload it."""
         registry = SkippedRegistry()
-        self.save_skipped(registry)
+        self.save_skipped(registry, language)
         return registry
 
-    def save_skipped(self, skipped: SkippedRegistry) -> None:
-        self._upload_json(self.SKIPPED_NAME, skipped.to_dict())
+    def save_skipped(self, skipped: SkippedRegistry, language: str) -> None:
+        self._upload_json(self._skipped_path(language), skipped.to_dict())
