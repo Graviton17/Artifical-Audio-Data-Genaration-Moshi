@@ -186,14 +186,25 @@ class HuggingFaceStorage(BaseStorage):
             )
         except Exception as err:  # noqa: BLE001
             if any(hint in str(err).lower() for hint in _NOT_FOUND_HINTS):
-                return SkippedRegistry()  # first run — nothing skipped yet
+                return self._init_skipped()  # first run — no registry yet
             raise StorageError(f"Failed to read skipped registry: {err}") from err
 
         if not local.exists():
             # Some backends silently skip a missing file instead of raising.
-            return SkippedRegistry()
+            return self._init_skipped()
         with open(local, "r", encoding="utf-8") as f:
             return SkippedRegistry.from_dict(json.load(f))
+
+    def _init_skipped(self) -> SkippedRegistry:
+        """First-run bootstrap: create an empty skipped registry and upload it.
+
+        Writing it back immediately means the bucket always has a
+        ``skipped.json`` after the first run, so subsequent machines take the
+        normal read path instead of re-detecting a missing file.
+        """
+        registry = SkippedRegistry()
+        self.save_skipped(registry)
+        return registry
 
     def save_skipped(self, skipped: SkippedRegistry) -> None:
         self._upload_json(self.SKIPPED_NAME, skipped.to_dict())
