@@ -812,7 +812,7 @@ def print_colored_token_stats(
         if report.cache_hits and report.cache_misses == 0:
             print(f"  {_GREEN}✓ Using local cache — no HF re-download needed{RESET}")
         elif report.cache_misses:
-            print(f"  {_DIM}Token stats read lightweight metadata.txt (not conversation.json){RESET}")
+            print(f"  {DIM}Token stats read lightweight metadata.txt (not conversation.json){RESET}")
 
     _section("Totals")
     _kv("Conversations", f"{report.conversations}", color=_WHITE)
