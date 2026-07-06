@@ -74,6 +74,7 @@ from .configuration_reader import (
     is_production,
 )
 from .llm import (
+    APILimitError,
     DEFAULT_GENERATION_PROVIDER,
     DEFAULT_VALIDATION_PROVIDER,
     BaseLLM,
@@ -956,6 +957,26 @@ def _corpus_postfix(corpus_budget: CorpusBudget | None, corpus_size_min: float |
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 
 
+def _save_checkpoint_before_shutdown(
+    storage: BaseStorage | None,
+    checkpoint: Checkpoint | None,
+    *,
+    language: str,
+    reason: str,
+) -> None:
+    """Best-effort checkpoint persist before terminating a production run."""
+    if storage is None or checkpoint is None:
+        return
+    try:
+        storage.save_checkpoint(checkpoint, language)
+        Logger.warning(
+            f"Checkpoint saved before shutdown ({reason}): "
+            f"{len(checkpoint.instances)} instance record(s)."
+        )
+    except StorageError as err:
+        Logger.error(f"Failed to save checkpoint before shutdown: {err}")
+
+
 def _conversation_payload(
     instance: CorpusInstance,
     index: int,
@@ -1302,9 +1323,20 @@ def process_instance(
             f"{progress.generated_sec / target_sec * 100 if target_sec else 0:.1f}%)"
         )
 
-        result = runner.run(**instance.to_profile())
-        if models:
-            result["models"] = models.to_dict()
+        try:
+            result = runner.run(**instance.to_profile())
+            if models:
+                result["models"] = models.to_dict()
+        except APILimitError as err:
+            Logger.error(f"API limit hit during conversation {index}: {err}")
+            _save_checkpoint_before_shutdown(
+                storage,
+                checkpoint,
+                language=instance.language,
+                reason="API rate-limit or quota exceeded",
+            )
+            raise
+
         manual_report = result.get("manual_validation")
         duration = getattr(manual_report, "duration_sec", None)
 
@@ -1362,6 +1394,7 @@ def process_instance(
             Logger.success(f"Wrote local output → {local_dir}")
         except OSError as err:
             Logger.warning(f"Failed to write local output for conversation {index}: {err}")
+
 
         if storage is not None and checkpoint is not None:
             # Upload the conversation, THEN advance + persist the checkpoint. The
@@ -1822,47 +1855,61 @@ def main(argv: list[str] | None = None) -> None:
         storage_lock=storage_lock,
     )
 
-    if args.workers <= 1:
-        instances_bar = tqdm(
-            indices,
-            desc="Corpus instances",
-            unit="inst",
-            dynamic_ncols=True,
-            bar_format=_INSTANCE_BAR_FMT,
-        )
-        for i in instances_bar:
-            if corpus_budget is not None and not corpus_budget.can_continue():
-                Logger.info("Corpus size target reached; stopping.")
-                break
-            _process_corpus_index(i, **worker_kwargs)
-            postfix = _corpus_postfix(corpus_budget, args.corpus_size)
-            if postfix:
-                instances_bar.set_postfix_str(postfix, refresh=True)
-        instances_bar.close()
-    else:
-        Logger.step(f"Running {len(indices)} instance(s) with {args.workers} worker(s).")
-        instances_bar = tqdm(
-            total=len(indices),
-            desc="Corpus instances",
-            unit="inst",
-            dynamic_ncols=True,
-            bar_format=_INSTANCE_BAR_FMT,
-        )
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futures = [pool.submit(_process_corpus_index, i, **worker_kwargs) for i in indices]
-            for future in as_completed(futures):
-                try:
-                    future.result()
-                except Exception as err:  # noqa: BLE001
-                    Logger.error(f"Worker failed: {err}")
-                instances_bar.update(1)
+    try:
+        if args.workers <= 1:
+            instances_bar = tqdm(
+                indices,
+                desc="Corpus instances",
+                unit="inst",
+                dynamic_ncols=True,
+                bar_format=_INSTANCE_BAR_FMT,
+            )
+            for i in instances_bar:
+                if corpus_budget is not None and not corpus_budget.can_continue():
+                    Logger.info("Corpus size target reached; stopping.")
+                    break
+                _process_corpus_index(i, **worker_kwargs)
                 postfix = _corpus_postfix(corpus_budget, args.corpus_size)
                 if postfix:
                     instances_bar.set_postfix_str(postfix, refresh=True)
-                if corpus_budget is not None and not corpus_budget.can_continue():
-                    Logger.info("Corpus size target reached; draining workers.")
-                    break
-        instances_bar.close()
+            instances_bar.close()
+        else:
+            Logger.step(f"Running {len(indices)} instance(s) with {args.workers} worker(s).")
+            instances_bar = tqdm(
+                total=len(indices),
+                desc="Corpus instances",
+                unit="inst",
+                dynamic_ncols=True,
+                bar_format=_INSTANCE_BAR_FMT,
+            )
+            with ThreadPoolExecutor(max_workers=args.workers) as pool:
+                futures = [pool.submit(_process_corpus_index, i, **worker_kwargs) for i in indices]
+                for future in as_completed(futures):
+                    try:
+                        future.result()
+                    except APILimitError as err:
+                        Logger.error(
+                            f"Terminating run: API rate-limit or quota exceeded ({err}). "
+                            "Resume later from the saved checkpoint."
+                        )
+                        instances_bar.close()
+                        return
+                    except Exception as err:  # noqa: BLE001
+                        Logger.error(f"Worker failed: {err}")
+                    instances_bar.update(1)
+                    postfix = _corpus_postfix(corpus_budget, args.corpus_size)
+                    if postfix:
+                        instances_bar.set_postfix_str(postfix, refresh=True)
+                    if corpus_budget is not None and not corpus_budget.can_continue():
+                        Logger.info("Corpus size target reached; draining workers.")
+                        break
+            instances_bar.close()
+    except APILimitError as err:
+        Logger.error(
+            f"Terminating run: API rate-limit or quota exceeded ({err}). "
+            "Resume later from the saved checkpoint."
+        )
+        return
 
     if corpus_budget is not None:
         Logger.success(
@@ -1870,6 +1917,7 @@ def main(argv: list[str] | None = None) -> None:
             f"{args.corpus_size} min accepted.",
             bold=True,
         )
+
 
     Logger.divider()
     Logger.success("All requested instances processed.", bold=True)

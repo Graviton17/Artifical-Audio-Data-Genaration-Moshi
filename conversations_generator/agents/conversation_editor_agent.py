@@ -34,9 +34,8 @@ The patch is applied by
 which then re-runs the deterministic timing/relationship layout so the edited
 conversation still passes manual validation by construction.
 
-Unlike the other agents, this one does **not** use a Langfuse-managed system
-prompt — its instructions are self-contained below, so no extra Langfuse prompt
-needs to be created for the edit path to work.
+The system prompt is managed in Langfuse under the name
+``conversation-editor-agent`` (local fallback: ``data/prompts/conversation-editor-agent.md``).
 """
 
 from __future__ import annotations
@@ -44,7 +43,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from ..llm import BaseLLM
 from .base_agent import BaseAgent
 
 # Speaker → gender is derived from the corpus ``gender_pair`` string (e.g. "F-M"
@@ -53,76 +51,12 @@ from .base_agent import BaseAgent
 _GENDER_WORDS = {"m": "Male", "f": "Female"}
 
 
-class _LocalPrompt:
-    """Minimal stand-in for a Langfuse prompt object (has a ``.compile``)."""
-
-    def __init__(self, text: str) -> None:
-        self.prompt = text
-
-    def compile(self, **_vars: Any) -> str:
-        return self.prompt
-
-
-_SYSTEM_PROMPT = """\
-You are a meticulous dialogue EDITOR for two-speaker (speaker_1 = agent,
-speaker_2 = user) spoken conversations. You are given an already-written
-conversation and a list of specific problems found by a validator. Your job is
-to fix ONLY those problems with the smallest possible changes — you are editing,
-NOT rewriting.
-
-Hard rules:
-- Change ONLY what is needed to resolve the listed issues. Every other turn must
-  stay exactly as it is. Do NOT rephrase, "improve", or re-translate untouched
-  turns.
-- Never invent new turns. You may only REPLACE the text/emotion/turn_type of an
-  existing turn, or DELETE an existing turn.
-- When a GROUND-TRUTH transcript is provided, it is the single source of truth.
-  Your ONLY job is to make each turn's text match its transcript line verbatim
-  (restoring a reworded turn) or DELETE a turn the transcript has no line for. Do
-  NOT "fix" content, wording, accent, emotion, or realism beyond that — those were
-  already approved on the transcript; changing them re-breaks faithfulness.
-- Keep the SAME language, script, and register as the surrounding dialogue
-  (Hindi in Devanagari, Hinglish in Roman, English in English — match what the
-  turn already uses).
-- Respect gender: a speaker's Hindi/Hinglish verbs and adjectives must agree with
-  THAT speaker's gender as given below (e.g. a male speaker says "karta hoon",
-  a female speaker says "karti hoon").
-- For a flagged interruption fragment (a turn whose text is cut off with "—"),
-  keep it a genuine incomplete fragment; do not complete the sentence.
-- When the validator complains about excessive/repetitive backchanneling, DELETE
-  the weakest, most redundant backchannel turns (turn_type "Backchanneling")
-  rather than editing them — but keep at least a few so the flow stays natural.
-- Preserve each edited turn's turn_type unless the issue is specifically about the
-  turn_type being wrong.
-
-Output format — return ONLY a single JSON object, no prose, no markdown fences:
-{"edits": [
-  {"turn_id": "<id>", "action": "replace", "text": "<new text>",
-   "emotion": "<optional: Neutral|Happy|Sad|Angry>",
-   "turn_type": "<optional: Normal|Overlapping|Interruption|Backchanneling>"},
-  {"turn_id": "<id>", "action": "delete"}
-]}
-If nothing genuinely needs changing, return {"edits": []}.
-"""
-
-
 class ConversationEditorAgent(BaseAgent):
     """Produce a minimal edit patch that fixes validator-flagged issues."""
 
-    # Not backed by Langfuse; prompt_name is only used for the base-class check.
     prompt_name = "conversation-editor-agent"
     temperature_key = "editor"
     agent_name = "editor"
-
-    def __init__(self, llm: BaseLLM | None = None) -> None:
-        # Bypass Langfuse: install the self-contained system prompt directly so
-        # this agent works without a managed prompt existing.
-        from ..llm import GroqLLM
-
-        if not self.prompt_name:
-            raise ValueError(f"{type(self).__name__} must set a class-level prompt_name.")
-        self.llm = llm if llm is not None else GroqLLM()
-        self.langfuse_prompt = _LocalPrompt(_SYSTEM_PROMPT)
 
     def run(
         self,

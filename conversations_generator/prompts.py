@@ -35,6 +35,7 @@ _LOCAL_PROMPT_FILES: dict[str, str] = {
     "conversation-formatter-agent": "conversation-formatter-agent.md",
     "conversation-content-validator-agent": "conversation-content-validator-agent.md",
     "conversation-format-validator-agent": "conversation-format-validator-agent.md",
+    "conversation-editor-agent": "conversation-editor-agent.md",
 }
 
 # Retry policy for the (network) Langfuse fetch before falling back to local.
