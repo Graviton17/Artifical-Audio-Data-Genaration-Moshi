@@ -49,6 +49,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from tqdm import tqdm
+
 from .agents import (
     ConversationEditorAgent,
     ConversationFormatterAgent,
@@ -923,6 +925,32 @@ class ConversationRunner:
 # that fail validation, so a persistently-failing profile can't loop forever.
 MAX_CONSECUTIVE_FAILURES = 10
 
+# tqdm bar format: percentage, bar, counts, elapsed, ETA, and rate.
+_DURATION_BAR_FMT = (
+    "{desc}: {percentage:3.0f}%|{bar}| "
+    "{n:.0f}/{total:.0f}s [{elapsed}<{remaining}, {rate_fmt}]"
+)
+_INSTANCE_BAR_FMT = (
+    "{desc}: {percentage:3.0f}%|{bar}| "
+    "{n_fmt}/{total_fmt} [{elapsed}<{remaining}]"
+)
+
+
+def _format_audio_minutes(sec: float) -> str:
+    """Compact duration label for tqdm postfixes."""
+    if sec >= 3600:
+        return f"{sec / 3600:.2f}h"
+    return f"{sec / 60:.1f}m"
+
+
+def _corpus_postfix(corpus_budget: CorpusBudget | None, corpus_size_min: float | None) -> str:
+    if corpus_budget is None:
+        return ""
+    generated = _format_audio_minutes(corpus_budget.generated_sec)
+    if corpus_size_min is not None:
+        return f"audio {generated}/{corpus_size_min:.1f}m"
+    return f"audio {generated}"
+
 # Local on-disk dump of every accepted conversation (dev and prod).
 # Layout: <repo>/output/<run_id>/conversation.json + metadata.txt
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
@@ -1240,6 +1268,19 @@ def process_instance(
     consecutive_failures = 0
     accepted = 0  # conversations accepted this run (for the max_conversations cap)
 
+    duration_bar = tqdm(
+        total=target_sec,
+        initial=progress.generated_sec,
+        desc=(
+            f"Inst {instance.corpus_combination_id} "
+            f"[{instance.language} | {instance.gender_pair}]"
+        ),
+        unit="s",
+        dynamic_ncols=True,
+        leave=False,
+        bar_format=_DURATION_BAR_FMT,
+    )
+
     while progress.generated_sec < target_sec:
         if corpus_budget is not None and not corpus_budget.can_continue():
             Logger.info(
@@ -1250,6 +1291,10 @@ def process_instance(
         if max_conversations is not None and accepted >= max_conversations:
             break
         index += 1
+        duration_bar.set_postfix_str(
+            f"conv {index}, accepted {accepted}, fails {consecutive_failures}",
+            refresh=False,
+        )
         Logger.divider()
         Logger.info(
             f"Instance {instance.corpus_combination_id} — conversation {index} "
@@ -1348,6 +1393,11 @@ def process_instance(
             except StorageError as err:
                 Logger.error(f"Storage failure on conversation {index}, aborting instance: {err}")
                 break
+            duration_bar.update(duration)
+            duration_bar.set_postfix_str(
+                f"conv {index}, accepted {accepted}, +{duration:.0f}s",
+                refresh=True,
+            )
             Logger.success(
                 f"Saved {path} (+{duration:.0f}s) — "
                 f"total {progress.generated_sec:.0f}/{target_sec:.0f}s",
@@ -1359,12 +1409,18 @@ def process_instance(
             progress.conversation_count += 1
             if corpus_budget is not None:
                 corpus_budget.add(duration)
+            duration_bar.update(duration)
+            duration_bar.set_postfix_str(
+                f"conv {index}, accepted {accepted}, +{duration:.0f}s",
+                refresh=True,
+            )
             Logger.success(
                 f"Conversation {index} accepted (+{duration:.0f}s) — "
                 f"total {progress.generated_sec:.0f}/{target_sec:.0f}s",
                 bold=True,
             )
 
+    duration_bar.close()
     Logger.success(
         f"Instance {instance.corpus_combination_id} complete: "
         f"{progress.generated_sec:.0f}s across {progress.conversation_count} conversation(s).",
@@ -1535,24 +1591,62 @@ def _thread_runner_cache() -> dict[tuple[LLMProvider, LLMProvider], RunnerHandle
     return cache
 
 
-def _initial_corpus_generated_sec(
-    storage: BaseStorage | None,
+def _languages_in_scope(corpus_df: Any, language: str | None) -> list[str]:
+    if language:
+        return [BaseStorage.normalize_language(language)]
+    langs = corpus_df["language"].str.lower().unique().tolist()
+    return sorted(BaseStorage.normalize_language(lang) for lang in langs)
+
+
+def _build_work_indices(
     corpus_df: Any,
+    checkpoint_caches: dict[str, Checkpoint] | None,
+    skipped_caches: dict[str, SkippedRegistry] | None,
+) -> tuple[list[int], dict[str, int]]:
+    """Pick corpus rows to run, highest ``joint_probability`` first.
+
+    Skips instances already completed (checkpoint) or abandoned (skipped.json)
+    so production runs resume without walking thousands of finished rows.
+    """
+    stats = {"skipped_complete": 0, "skipped_abandoned": 0, "pending": 0}
+    candidates: list[tuple[int, float]] = []
+
+    for i in range(len(corpus_df)):
+        row = corpus_df.iloc[i]
+        instance_id = int(row["corpus_combination_id"])
+        lang = BaseStorage.normalize_language(str(row["language"]))
+        target_sec = float(row.get("duration_sec") or 0)
+
+        if skipped_caches and lang in skipped_caches and instance_id in skipped_caches[lang]:
+            stats["skipped_abandoned"] += 1
+            continue
+
+        if checkpoint_caches and lang in checkpoint_caches:
+            prog = checkpoint_caches[lang].instances.get(str(instance_id))
+            if prog and target_sec > 0 and prog.generated_sec >= target_sec:
+                stats["skipped_complete"] += 1
+                continue
+
+        joint_prob = float(row.get("joint_probability") or 0)
+        candidates.append((i, joint_prob))
+        stats["pending"] += 1
+
+    candidates.sort(key=lambda item: item[1], reverse=True)
+    return [i for i, _ in candidates], stats
+
+
+def _corpus_sec_from_checkpoints(
+    corpus_df: Any,
+    checkpoint_caches: dict[str, Checkpoint],
     *,
     language: str | None = None,
 ) -> float:
     """Sum accepted duration already recorded for instances in this run scope."""
-    if storage is None:
-        return 0.0
     ids = set(corpus_df["corpus_combination_id"].tolist())
     total = 0.0
-    languages = (
-        [BaseStorage.normalize_language(language)]
-        if language
-        else corpus_df["language"].str.lower().unique().tolist()
-    )
-    for lang in languages:
-        checkpoint = storage.load_checkpoint(lang)
+    for lang, checkpoint in checkpoint_caches.items():
+        if language and lang != BaseStorage.normalize_language(language):
+            continue
         for prog in checkpoint.instances.values():
             if prog.corpus_combination_id in ids:
                 total += prog.generated_sec
@@ -1620,7 +1714,9 @@ def main(argv: list[str] | None = None) -> None:
     args = _parse_args(argv)
 
     if args.tokenstats:
-        Logger.step("Loading token usage from HuggingFace bucket...")
+        Logger.step(
+            "Scanning HuggingFace bucket metadata (metadata.txt — not conversation.json)..."
+        )
         print_token_stats(language=args.language, refresh=args.refresh_cache)
         return
 
@@ -1663,13 +1759,24 @@ def main(argv: list[str] | None = None) -> None:
     max_conversations: int | None = None
     if production:
         Logger.step(
-            f"PRODUCTION run — processing all {len(corpus_df)} instances "
+            f"PRODUCTION run — processing corpus instances "
             f"(bucket layout: <language>/instance_<id>/conversation_<n>/)."
         )
         storage = HuggingFaceStorage()
-        checkpoint_caches = {}
-        skipped_caches = {}
-        indices = list(range(len(corpus_df)))
+        scope_languages = _languages_in_scope(corpus_df, args.language)
+        Logger.step(
+            f"Syncing checkpoints for {', '.join(scope_languages)} "
+            f"(cached under .cache/hf_control/ after first run)..."
+        )
+        checkpoint_caches, skipped_caches = storage.preload_language_state(scope_languages)
+        work_stats: dict[str, int] = {}
+        indices, work_stats = _build_work_indices(corpus_df, checkpoint_caches, skipped_caches)
+        Logger.info(
+            f"Instance queue: {work_stats['pending']} pending, "
+            f"{work_stats['skipped_complete']} already complete, "
+            f"{work_stats['skipped_abandoned']} abandoned — "
+            f"ordered by joint_probability (distribution priority)."
+        )
     else:
         Logger.step("DEVELOPMENT run — generating conversations (no HF upload).")
         indices = [
@@ -1679,10 +1786,10 @@ def main(argv: list[str] | None = None) -> None:
 
     corpus_target_sec = args.corpus_size * 60.0 if args.corpus_size else None
     initial_sec = (
-        _initial_corpus_generated_sec(
-            storage, corpus_df, language=args.language
+        _corpus_sec_from_checkpoints(
+            corpus_df, checkpoint_caches, language=args.language
         )
-        if corpus_target_sec
+        if corpus_target_sec and checkpoint_caches
         else 0.0
     )
     corpus_budget: CorpusBudget | None = None
@@ -1701,7 +1808,9 @@ def main(argv: list[str] | None = None) -> None:
         Logger.error("No corpus indices to process.")
         return
 
-    storage_lock = threading.Lock() if args.workers > 1 and storage is not None else None
+    storage_lock = threading.Lock() if args.workers > 1 else None
+    if args.workers > 1:
+        tqdm.set_lock(storage_lock)
     worker_kwargs = dict(
         corpus_df=corpus_df,
         args=args,
@@ -1714,13 +1823,31 @@ def main(argv: list[str] | None = None) -> None:
     )
 
     if args.workers <= 1:
-        for i in indices:
+        instances_bar = tqdm(
+            indices,
+            desc="Corpus instances",
+            unit="inst",
+            dynamic_ncols=True,
+            bar_format=_INSTANCE_BAR_FMT,
+        )
+        for i in instances_bar:
             if corpus_budget is not None and not corpus_budget.can_continue():
                 Logger.info("Corpus size target reached; stopping.")
                 break
             _process_corpus_index(i, **worker_kwargs)
+            postfix = _corpus_postfix(corpus_budget, args.corpus_size)
+            if postfix:
+                instances_bar.set_postfix_str(postfix, refresh=True)
+        instances_bar.close()
     else:
         Logger.step(f"Running {len(indices)} instance(s) with {args.workers} worker(s).")
+        instances_bar = tqdm(
+            total=len(indices),
+            desc="Corpus instances",
+            unit="inst",
+            dynamic_ncols=True,
+            bar_format=_INSTANCE_BAR_FMT,
+        )
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
             futures = [pool.submit(_process_corpus_index, i, **worker_kwargs) for i in indices]
             for future in as_completed(futures):
@@ -1728,9 +1855,14 @@ def main(argv: list[str] | None = None) -> None:
                     future.result()
                 except Exception as err:  # noqa: BLE001
                     Logger.error(f"Worker failed: {err}")
+                instances_bar.update(1)
+                postfix = _corpus_postfix(corpus_budget, args.corpus_size)
+                if postfix:
+                    instances_bar.set_postfix_str(postfix, refresh=True)
                 if corpus_budget is not None and not corpus_budget.can_continue():
                     Logger.info("Corpus size target reached; draining workers.")
                     break
+        instances_bar.close()
 
     if corpus_budget is not None:
         Logger.success(

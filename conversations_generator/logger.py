@@ -29,6 +29,16 @@ EMOJIS = {
 
 class Logger:
     @staticmethod
+    def _emit(line: str) -> None:
+        """Print without clobbering an active tqdm progress bar."""
+        try:
+            from tqdm import tqdm
+
+            tqdm.write(line)
+        except ImportError:
+            print(line)
+
+    @staticmethod
     def _log(level: str, message: str, bold: bool = False) -> None:
         color = COLORS.get(level, "")
         emoji = EMOJIS.get(level, "")
@@ -36,7 +46,7 @@ class Logger:
         
         style = f"{BOLD}" if bold else ""
         
-        print(f"{DIM}[{timestamp}]{RESET} {color}{style}{emoji}{message}{RESET}")
+        Logger._emit(f"{DIM}[{timestamp}]{RESET} {color}{style}{emoji}{message}{RESET}")
 
     @classmethod
     def info(cls, message: str) -> None:
@@ -76,15 +86,15 @@ class Logger:
     @classmethod
     def divider(cls) -> None:
         """Visual divider."""
-        print(f"{DIM}{'━' * 70}{RESET}")
+        cls._emit(f"{DIM}{'━' * 70}{RESET}")
 
     @classmethod
     def stream_start(cls, label: str) -> None:
         """Header printed once before a live token stream begins."""
         timestamp = datetime.now().strftime("%H:%M:%S")
         color = COLORS["stream"]
-        print(f"{DIM}[{timestamp}]{RESET} {color}{BOLD}📡 {label}{RESET}")
-        print(f"{DIM}{'┈' * 70}{RESET}")
+        cls._emit(f"{DIM}[{timestamp}]{RESET} {color}{BOLD}📡 {label}{RESET}")
+        cls._emit(f"{DIM}{'┈' * 70}{RESET}")
 
     @classmethod
     def stream_chunk(cls, text: str) -> None:
@@ -97,4 +107,4 @@ class Logger:
     def stream_end(cls) -> None:
         """Footer printed once a live token stream finishes."""
         print()
-        print(f"{DIM}{'┈' * 70}{RESET}")
+        cls._emit(f"{DIM}{'┈' * 70}{RESET}")

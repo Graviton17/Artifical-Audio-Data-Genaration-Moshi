@@ -37,6 +37,7 @@ from typing import Any
 from ..configuration_reader import get as config_get
 from .base_storage import BaseStorage, StorageError
 from .checkpoint import Checkpoint
+from .disk_cache import ControlFileCache
 from .skipped import SkippedRegistry
 
 try:  # Lazy-ish import so the package works without the SDK installed.
@@ -96,9 +97,81 @@ class HuggingFaceStorage(BaseStorage):
         os.environ.setdefault("HF_TOKEN", self.token)
 
         self._tmp = Path(tempfile.mkdtemp(prefix="hf_bucket_"))
+        self._disk_cache = ControlFileCache(self.bucket_id)
 
         if create:
             self._ensure_bucket(private)
+
+    def _suppress_hf_progress(self) -> None:
+        os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+
+    def _load_control_json(
+        self,
+        language: str,
+        filename: str,
+        *,
+        force_remote: bool = False,
+    ) -> dict[str, Any] | None:
+        """Load a small control JSON from disk cache or HF. ``None`` if absent."""
+        self._suppress_hf_progress()
+        lang = self.normalize_language(language)
+        if not force_remote:
+            cached = self._disk_cache.read(lang, filename)
+            if cached is not None:
+                return cached
+
+        path = f"{self.language_root(lang)}/{filename}"
+        local = self._tmp / path.replace("/", "__")
+        try:
+            download_bucket_files(
+                self.bucket_id,
+                files=[(path, str(local))],
+            )
+        except Exception as err:  # noqa: BLE001
+            if any(hint in str(err).lower() for hint in _NOT_FOUND_HINTS):
+                return None
+            raise StorageError(f"Failed to read {path}: {err}") from err
+
+        if not local.exists():
+            return None
+
+        with open(local, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            self._disk_cache.write(lang, filename, data)
+            return data
+        return None
+
+    def preload_language_state(
+        self,
+        languages: list[str],
+        *,
+        force_remote: bool = True,
+    ) -> tuple[dict[str, Checkpoint], dict[str, SkippedRegistry]]:
+        """Sync checkpoint + skipped for each language once at run startup."""
+        checkpoints: dict[str, Checkpoint] = {}
+        skipped: dict[str, SkippedRegistry] = {}
+        for language in languages:
+            lang = self.normalize_language(language)
+            cp_data = self._load_control_json(
+                lang, self.CHECKPOINT_NAME, force_remote=force_remote
+            )
+            checkpoints[lang] = (
+                Checkpoint.from_dict(cp_data) if cp_data else self._init_checkpoint(language)
+            )
+            sk_data = self._load_control_json(
+                lang, self.SKIPPED_NAME, force_remote=force_remote
+            )
+            skipped[lang] = (
+                SkippedRegistry.from_dict(sk_data) if sk_data else self._init_skipped(language)
+            )
+        return checkpoints, skipped
+
+    def _save_control_json(self, language: str, filename: str, payload: dict[str, Any]) -> None:
+        lang = self.normalize_language(language)
+        path = f"{self.language_root(lang)}/{filename}"
+        self._upload_json(path, payload)
+        self._disk_cache.write(lang, filename, payload)
 
     # ------------------------------------------------------------------ #
     # Path helpers
@@ -181,23 +254,10 @@ class HuggingFaceStorage(BaseStorage):
     # Checkpoint
     # ------------------------------------------------------------------ #
     def load_checkpoint(self, language: str) -> Checkpoint:
-        path = self._checkpoint_path(language)
-        local = self._tmp / path.replace("/", "__")
-        try:
-            download_bucket_files(
-                self.bucket_id,
-                files=[(path, str(local))],
-            )
-        except Exception as err:  # noqa: BLE001
-            if any(hint in str(err).lower() for hint in _NOT_FOUND_HINTS):
-                return self._init_checkpoint(language)  # first run — no checkpoint yet
-            raise StorageError(f"Failed to read checkpoint: {err}") from err
-
-        if not local.exists():
-            # Some backends silently skip a missing file instead of raising.
+        data = self._load_control_json(language, self.CHECKPOINT_NAME)
+        if data is None:
             return self._init_checkpoint(language)
-        with open(local, "r", encoding="utf-8") as f:
-            return Checkpoint.from_dict(json.load(f))
+        return Checkpoint.from_dict(data)
 
     def _init_checkpoint(self, language: str) -> Checkpoint:
         """First-run bootstrap: create an empty checkpoint and upload it."""
@@ -206,29 +266,16 @@ class HuggingFaceStorage(BaseStorage):
         return checkpoint
 
     def save_checkpoint(self, checkpoint: Checkpoint, language: str) -> None:
-        self._upload_json(self._checkpoint_path(language), checkpoint.to_dict())
+        self._save_control_json(language, self.CHECKPOINT_NAME, checkpoint.to_dict())
 
     # ------------------------------------------------------------------ #
     # Skipped registry
     # ------------------------------------------------------------------ #
     def load_skipped(self, language: str) -> SkippedRegistry:
-        path = self._skipped_path(language)
-        local = self._tmp / path.replace("/", "__")
-        try:
-            download_bucket_files(
-                self.bucket_id,
-                files=[(path, str(local))],
-            )
-        except Exception as err:  # noqa: BLE001
-            if any(hint in str(err).lower() for hint in _NOT_FOUND_HINTS):
-                return self._init_skipped(language)  # first run — no registry yet
-            raise StorageError(f"Failed to read skipped registry: {err}") from err
-
-        if not local.exists():
-            # Some backends silently skip a missing file instead of raising.
+        data = self._load_control_json(language, self.SKIPPED_NAME)
+        if data is None:
             return self._init_skipped(language)
-        with open(local, "r", encoding="utf-8") as f:
-            return SkippedRegistry.from_dict(json.load(f))
+        return SkippedRegistry.from_dict(data)
 
     def _init_skipped(self, language: str) -> SkippedRegistry:
         """First-run bootstrap: create an empty skipped registry and upload it."""
@@ -237,4 +284,4 @@ class HuggingFaceStorage(BaseStorage):
         return registry
 
     def save_skipped(self, skipped: SkippedRegistry, language: str) -> None:
-        self._upload_json(self._skipped_path(language), skipped.to_dict())
+        self._save_control_json(language, self.SKIPPED_NAME, skipped.to_dict())

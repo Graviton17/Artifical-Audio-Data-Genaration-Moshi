@@ -42,6 +42,19 @@ _MODELS_SECTION_RE = re.compile(
     r"^## Models\b.*?(?=^## |\Z)",
     re.MULTILINE | re.DOTALL,
 )
+_USAGE_SECTION_RE = re.compile(
+    r"^## LLM usage\b.*?(?=^## |\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+_AGENT_LINE_RE = re.compile(
+    r"^(?P<agent>[^:]+):\s*calls=(?P<calls>\d+),\s*"
+    r"in=(?P<in>\d+),\s*out=(?P<out>\d+),\s*"
+    r"total=(?P<total>\d+),\s*duration_sec=(?P<duration>[0-9.]+)"
+)
+_CALL_LINE_RE = re.compile(
+    r"^- \[(?P<stage>[^\]]+)\]\s+(?P<agent>[^\s(]+)\s+\((?P<model>[^)]+)\):\s*"
+    r"in=(?P<in>\d+),\s*out=(?P<out>\d+),\s*duration_sec=(?P<duration>[0-9.]+)"
+)
 
 _CACHE_ROOT = Path(__file__).resolve().parent.parent / ".cache" / "hf_token_stats"
 
@@ -235,6 +248,32 @@ def _save_cache_index(bucket_id: str, language: str | None, index: dict[str, Any
     path.write_text(json.dumps(index, indent=2), encoding="utf-8")
 
 
+def iter_hf_metadata_files(
+    language: str | None = None,
+    *,
+    bucket_id: str | None = None,
+) -> Iterator[tuple[str, str, str]]:
+    """Yield ``(language, path, xet_hash)`` for every ``metadata.txt``."""
+    if list_bucket_tree is None:
+        raise ImportError("huggingface_hub>=1.5.0 is required.")
+
+    bucket = bucket_id or _bucket_id()
+    prefixes = set(_language_prefixes(language))
+
+    for item in list_bucket_tree(bucket, recursive=True):
+        path = getattr(item, "path", None)
+        xet_hash = getattr(item, "xet_hash", None)
+        if not path or not xet_hash or not path.endswith("metadata.txt"):
+            continue
+        parts = path.split("/")
+        if len(parts) < 4:
+            continue
+        lang = parts[0].lower()
+        if lang not in prefixes:
+            continue
+        yield lang, path, str(xet_hash)
+
+
 def iter_hf_conversation_files(
     language: str | None = None,
     *,
@@ -261,6 +300,147 @@ def iter_hf_conversation_files(
         yield lang, path, str(xet_hash)
 
 
+def _parse_scalar(value: str) -> Any:
+    text = value.strip()
+    if text.lower() in {"true", "false"}:
+        return text.lower() == "true"
+    if text.lower() == "none" or text == "":
+        return None
+    try:
+        if "." in text:
+            return float(text)
+        return int(text)
+    except ValueError:
+        return text
+
+
+def _parse_header_fields(text: str) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    for line in text.splitlines():
+        if line.startswith("## "):
+            break
+        if ": " not in line:
+            continue
+        key, value = line.split(": ", 1)
+        fields[key.strip()] = _parse_scalar(value)
+    return fields
+
+
+def _parse_models_section(text: str) -> ModelInfo | None:
+    match = _MODELS_SECTION_RE.search(text)
+    if not match:
+        return None
+    raw: dict[str, str] = {}
+    for line in match.group(0).splitlines():
+        if ": " not in line or line.startswith("##"):
+            continue
+        key, value = line.split(": ", 1)
+        raw[key.strip()] = value.strip()
+    return ModelInfo.from_dict(raw)
+
+
+def parse_metadata_usage(text: str) -> dict[str, Any] | None:
+    """Rebuild the ``usage`` dict from a ``metadata.txt`` body."""
+    match = _USAGE_SECTION_RE.search(text)
+    if not match:
+        return None
+
+    section = match.group(0)
+    totals: dict[str, Any] = {}
+    by_agent: dict[str, dict[str, Any]] = {}
+    calls: list[dict[str, Any]] = []
+
+    in_by_agent = False
+    in_calls = False
+    for line in section.splitlines():
+        stripped = line.strip()
+        if stripped == "### By agent":
+            in_by_agent = True
+            in_calls = False
+            continue
+        if stripped == "### Per call (chronological)":
+            in_by_agent = False
+            in_calls = True
+            continue
+        if stripped.startswith("##") or not stripped:
+            continue
+
+        if not in_by_agent and not in_calls and ": " in stripped:
+            key, value = stripped.split(": ", 1)
+            totals[key.strip()] = _parse_scalar(value)
+            continue
+
+        if in_by_agent:
+            agent_match = _AGENT_LINE_RE.match(stripped)
+            if agent_match:
+                agent = agent_match.group("agent").strip()
+                by_agent[agent] = {
+                    "calls": int(agent_match.group("calls")),
+                    "input_tokens": int(agent_match.group("in")),
+                    "output_tokens": int(agent_match.group("out")),
+                    "total_tokens": int(agent_match.group("total")),
+                    "duration_sec": float(agent_match.group("duration")),
+                }
+            continue
+
+        if in_calls:
+            call_match = _CALL_LINE_RE.match(stripped)
+            if call_match:
+                stage_raw = call_match.group("stage")
+                attempt = None
+                if ", attempt=" in stage_raw:
+                    stage, attempt_s = stage_raw.split(", attempt=", 1)
+                    attempt = int(attempt_s)
+                else:
+                    stage = stage_raw
+                in_tok = int(call_match.group("in"))
+                out_tok = int(call_match.group("out"))
+                calls.append(
+                    {
+                        "stage": stage.strip(),
+                        "attempt": attempt,
+                        "agent": call_match.group("agent").strip(),
+                        "model": call_match.group("model").strip(),
+                        "input_tokens": in_tok,
+                        "output_tokens": out_tok,
+                        "total_tokens": in_tok + out_tok,
+                        "duration_sec": float(call_match.group("duration")),
+                    }
+                )
+
+    if not totals and not by_agent and not calls:
+        return None
+
+    if "total_tokens" not in totals:
+        totals["total_tokens"] = int(totals.get("total_input_tokens", 0) or 0) + int(
+            totals.get("total_output_tokens", 0) or 0
+        )
+
+    return {"totals": totals, "by_agent": by_agent, "calls": calls}
+
+
+def _parse_metadata_record(lang: str, path: str, text: str) -> ConversationRecord:
+    header = _parse_header_fields(text)
+    usage = parse_metadata_usage(text)
+    duration = header.get("duration_sec")
+    if duration is None:
+        for line in text.splitlines():
+            if line.startswith("duration_sec:"):
+                duration = _parse_scalar(line.split(": ", 1)[1])
+                break
+
+    return ConversationRecord(
+        path=path.replace("/metadata.txt", "/conversation.json"),
+        language=lang,
+        corpus_combination_id=header.get("corpus_combination_id"),
+        index=header.get("conversation_index"),
+        duration_sec=float(duration) if duration is not None else None,
+        usage=usage,
+        models=_parse_models_section(text),
+        passed=header.get("passed"),
+    )
+
+
 def _parse_conversation_json(
     lang: str,
     path: str,
@@ -285,7 +465,12 @@ def load_hf_conversations(
     use_cache: bool = True,
     refresh: bool = False,
 ) -> tuple[list[ConversationRecord], int, int]:
-    """Load conversations from HF, using a local disk cache when possible.
+    """Load token usage from HF ``metadata.txt`` files (not full conversation JSON).
+
+    ``metadata.txt`` already carries the ``## LLM usage`` block written at save
+    time, so token stats do not need to download heavy ``conversation.json``
+    payloads. Falls back to ``conversation.json`` only when metadata lacks usage
+    (older bucket objects).
 
     Returns ``(records, cache_hits, cache_misses)``.
     """
@@ -297,7 +482,7 @@ def load_hf_conversations(
 
     remote_files = {
         path: (lang, xet_hash)
-        for lang, path, xet_hash in iter_hf_conversation_files(language, bucket_id=bucket)
+        for lang, path, xet_hash in iter_hf_metadata_files(language, bucket_id=bucket)
     }
 
     cache_index = _load_cache_index(bucket, language)
@@ -325,12 +510,30 @@ def load_hf_conversations(
                 pass
         to_download.append((lang, path, xet_hash))
 
-    for lang, path, xet_hash in to_download:
+    from tqdm import tqdm
+
+    download_bar = tqdm(
+        to_download,
+        desc="Reading metadata.txt",
+        unit="file",
+        disable=not to_download,
+        dynamic_ncols=True,
+    )
+    for lang, path, xet_hash in download_bar:
         local = _cache_data_path(bucket, path)
         local.parent.mkdir(parents=True, exist_ok=True)
         download_bucket_files(bucket, files=[(path, str(local))])
-        data = json.loads(local.read_text(encoding="utf-8"))
-        record = _parse_conversation_json(lang, path, data)
+        text = local.read_text(encoding="utf-8")
+        record = _parse_metadata_record(lang, path, text)
+
+        if record.usage is None:
+            json_path = path.replace("/metadata.txt", "/conversation.json")
+            json_local = _cache_data_path(bucket, json_path)
+            json_local.parent.mkdir(parents=True, exist_ok=True)
+            download_bucket_files(bucket, files=[(json_path, str(json_local))])
+            data = json.loads(json_local.read_text(encoding="utf-8"))
+            record = _parse_conversation_json(lang, json_path, data)
+
         local.write_text(
             json.dumps(record.to_cache_dict(), ensure_ascii=False, indent=2),
             encoding="utf-8",
@@ -605,9 +808,11 @@ def print_colored_token_stats(
     if report.cache_hits or report.cache_misses:
         _section("Cache")
         _kv("Cache hits", str(report.cache_hits), color=_GREEN)
-        _kv("Downloaded (new/changed)", str(report.cache_misses), color=_YELLOW if report.cache_misses else _GREEN)
+        _kv("Downloaded metadata.txt", str(report.cache_misses), color=_YELLOW if report.cache_misses else _GREEN)
         if report.cache_hits and report.cache_misses == 0:
             print(f"  {_GREEN}✓ Using local cache — no HF re-download needed{RESET}")
+        elif report.cache_misses:
+            print(f"  {_DIM}Token stats read lightweight metadata.txt (not conversation.json){RESET}")
 
     _section("Totals")
     _kv("Conversations", f"{report.conversations}", color=_WHITE)
@@ -697,7 +902,7 @@ def print_token_stats(
     *,
     refresh: bool = False,
 ) -> tuple[TokenStatsReport, CostStatsReport]:
-    """Load HF data (cached) and print token + cost summary to stdout."""
+    """List bucket metadata files, aggregate usage, and print summary."""
     records, cache_hits, cache_misses = load_hf_conversations(
         language,
         use_cache=True,
