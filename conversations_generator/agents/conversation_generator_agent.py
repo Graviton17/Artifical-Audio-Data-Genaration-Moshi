@@ -100,12 +100,16 @@ def _accent_guidance(agent_accent: str | None, user_accent: str | None) -> list[
     return [
         "",
         "## Accent markers to actually use (MANDATORY — this is graded)",
-        "Plain Hindi/Hinglish with no regional flavour FAILS the accent check — one "
-        "address term alone is NOT enough. Starting from this speaker's FIRST turn, "
-        "weave in several of the markers below from DIFFERENT categories and reuse "
-        "them naturally throughout (they also make great backchannels, which adds "
-        "variety). Keep normal Devanagari/Romanized spelling — real words, not "
-        "phonetic tricks. The address term must also match the addressee's gender.",
+        "Plain Hindi/Hinglish with no regional flavour FAILS the accent check. "
+        "Starting from this speaker's FIRST turn, weave in AT LEAST THREE different "
+        "markers below from DIFFERENT categories, and keep the accent audible "
+        "throughout. Put the accent into the CONTENT of normal turns — regional "
+        "vocabulary, phrasing, and sentence structure, plus the address term — NOT "
+        "as repeated standalone interjection/backchannel words. A few exclamation "
+        "particles dropped in as backchannels (e.g. repeating 'ओ बाबा', 'ईश!', 'बाप "
+        "रे!') read as repetitive filler and FAIL both the accent check and the "
+        "realism check. Keep normal Devanagari/Romanized spelling — real words, not "
+        "phonetic tricks. The address term must match the addressee's gender.",
         *entries,
     ]
 
@@ -150,6 +154,38 @@ def _language_directive(language: str | None) -> list[str]:
     ]
 
 
+def _emotion_register_directive(
+    agent_emotion: str | None,
+    user_emotion: str | None,
+    conversation_type: str | None,
+) -> list[str]:
+    """Guidance on rendering each speaker's emotion realistically for their role.
+
+    The corpus assigns emotions independently of the topic and conversation type,
+    so combinations like a *Happy* agent handling a *complaint* are common. Left
+    unguided, small models render "Happy" as giddy/slangy, which the validator
+    flags as an unrealistic "caricature" (a critical realism failure). This block
+    tells the model to express the emotion in a way that fits the speaker's role
+    and the register, rather than literally/cartoonishly.
+    """
+    if not (agent_emotion or user_emotion):
+        return []
+    ctype = f" (conversation type: {conversation_type})" if conversation_type else ""
+    return [
+        "",
+        f"## Emotion & register (MANDATORY){ctype}",
+        "Express each speaker's assigned emotion in a way that FITS their role and "
+        "the situation — an emotion must never turn a speaker into a caricature. In "
+        "a service, support, complaint, formal, or professional context a \"Happy\" "
+        "agent is warm, upbeat, and reassuring (NOT giddy, jokey, or casual); an "
+        "\"Angry\" speaker is firm and terse (NOT cartoonish); \"Sad\" is subdued, "
+        "not melodramatic. Keep the register consistent with the conversation type: "
+        "for a formal/professional type do NOT use casual slang (e.g. \"अरे यार\", "
+        "\"झकास\", \"बिंदास\"). The emotion should colour HOW things are said while "
+        "staying believable for who is saying it and why they are talking.",
+    ]
+
+
 def _number_directive(include_numbers: bool) -> list[str]:
     """Prompt block controlling whether the conversation is number-rich.
 
@@ -163,14 +199,15 @@ def _number_directive(include_numbers: bool) -> list[str]:
             "## Numbers (MANDATORY for this conversation)",
             "Weave several CONCRETE numbers naturally into the dialogue — e.g. "
             "prices/amounts, dates, durations, quantities, percentages/discounts, "
-            "measurements, ages, scores, or distances — AND the reasoning around "
-            "them: speakers should state specific figures and then explain, "
-            "justify, compare, or do simple math with them (why a price is high, "
-            "how a discount was calculated, comparing two options, splitting a "
-            "cost, etc.), not just drop a number in isolation. Spell numbers the "
-            "way people actually SAY them aloud in this language (this is spoken "
-            "audio data), not as bare digits where that would sound unnatural. "
-            "Keep it realistic — a few well-motivated numbers across the "
+            "measurements, ages, scores, or distances — with light reasoning around "
+            "them (why something costs what it does, comparing two options, a rough "
+            "trade-off). Keep it the way real people talk, NOT like a calculator: "
+            "round and approximate out loud (\"around one and a half lakhs\", \"about "
+            "two hundred guests\", \"roughly half\"), and do NOT recite exact running "
+            "totals or do precise step-by-step arithmetic every turn — that reads as "
+            "robotic and fails realism. Spell numbers the way people actually SAY "
+            "them aloud in this language (this is spoken audio data), not as bare "
+            "digits. Keep it realistic — a few well-motivated numbers across the "
             "conversation, not a figure crammed into every line.",
         ]
     return [
@@ -305,6 +342,19 @@ class ConversationGeneratorAgent(BaseAgent):
             f"**Language:** {language}",
         ]
 
+        # Keep the dialogue tightly on the topic — the single biggest reason a
+        # conversation gets judged "not to the point". This is a hard requirement,
+        # not a stylistic nicety.
+        lines += [
+            "",
+            "## Stay on the point (MANDATORY)",
+            "Every exchange must directly develop the Title/Context above. Open and "
+            "close with at most one brief pleasantry; everything in between must "
+            "advance the actual subject with specific, concrete detail (real "
+            "options, reasons, trade-offs, decisions) — no generic small talk, no "
+            "vague filler, no repeating the same point in different words.",
+        ]
+
         lines.extend(_language_directive(language))
 
         if conversation_type:
@@ -325,14 +375,22 @@ class ConversationGeneratorAgent(BaseAgent):
         # Concrete, high-salience markers for any non-Normal accent (no-op otherwise).
         lines.extend(_accent_guidance(agent_accent, user_accent))
 
+        # Render emotions realistically for the role/register (avoids "caricature"
+        # realism failures when the assigned emotion clashes with the topic).
+        lines.extend(_emotion_register_directive(agent_emotion, user_emotion, conversation_type))
+
         if target_duration_sec is not None:
             lines.append("")
             lines.append("## Target duration")
             lines.append(
                 f"Aim for a conversation that lasts approximately "
                 f"**{target_duration_sec:.0f} seconds** (~{target_duration_sec / 60:.1f} "
-                f"minutes) when spoken at a natural pace (~2-3 words/second). Write "
-                f"enough turns and content to fill it — do not end early."
+                f"minutes) when spoken at a natural pace (~2-3 words/second). Reach "
+                f"this length by developing the topic in DEPTH — more sub-points, "
+                f"detail, and back-and-forth on the actual subject — NOT by adding "
+                f"small talk, filler, or repetition. If you would have to pad to hit "
+                f"the target, prefer a slightly shorter conversation that stays on "
+                f"point over a longer one that drifts."
             )
 
         # Number inclusion is decided per-conversation by the runner.

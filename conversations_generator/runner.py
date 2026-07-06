@@ -359,8 +359,9 @@ class ConversationRunner:
             Logger.warning(f"Agent validation failed. Verdict: {agent_report.verdict}")
 
             # ---- Stage 4b: TARGETED EDITS before falling back to full regeneration ----
-            # Try to fix only the flagged turns (edit in place) rather than throwing
-            # away the whole conversation and regenerating from scratch.
+            # Always try to repair the flagged turns in place first; only if the
+            # editor can't produce a passing fix do we fall back to regenerating
+            # the whole conversation on the next outer attempt.
             edit_result = self._repair_by_editing(turns, topic, agent_report, profile)
             if edit_result is not None:
                 turns, manual_report, edited_agent_report = edit_result
@@ -689,8 +690,31 @@ def main() -> None:
         Logger.info(f"Loaded checkpoint with {len(checkpoint.instances)} instance record(s).")
         indices = range(len(corpus_df))
     else:
-        Logger.step("DEVELOPMENT run — generating a single conversation for instance iloc[0] (no upload).")
-        indices = [234, 0, 135]
+        Logger.step("DEVELOPMENT run — generating one conversation per durability-test instance (no upload).")
+        # Durability set: iloc positions chosen to exercise the pipeline's hardest
+        # axes — each language (Hindi forces Devanagari, English forbids it),
+        # every accent (the most-missed corpus field), non-Neutral / opposing
+        # emotions, and gender agreement across all pairs. Comment out rows to
+        # shorten a run. (The corpus is a full factorial, so every combo exists.)
+        indices = [
+            # --- original smoke tests ---
+            234,   # English  | FM | user West accent | Neutral/Sad
+            0,     # Hinglish | FM | Normal           | Neutral/Neutral (baseline)
+            135,   # Hindi    | MM | user Bengali     | Neutral/Neutral
+            # --- Hindi (Devanagari + gender agreement + accents) ---
+            59,    # Hindi    | MF | Normal            | Neutral/Neutral (gender baseline)
+            3278,  # Hindi    | FM | Punjabi both      | Happy/Happy
+            6599,  # Hindi    | MM | Bengali both      | Angry/Sad (opposing emotion)
+            3235,  # Hindi    | FF | West/Bengali mix  | Happy/Angry (mixed accents)
+            # --- Hinglish (code-mixing + accents) ---
+            5,     # Hinglish | FM | Normal            | Neutral/Happy (baseline)
+            4921,  # Hinglish | FF | Gujarati both     | Sad/Sad
+            4751,  # Hinglish | MF | South Indian both | Angry/Neutral
+            # --- English (no Devanagari; lang-vs-accent tension) ---
+            2225,  # English  | MF | Normal            | Sad/Sad (pure emotional)
+            2882,  # English  | FM | West both         | Happy/Neutral
+            2563,  # English  | MM | Bengali/Punjabi   | Neutral/Angry (mixed accents)
+        ]
         max_conversations = 1
 
     for i in indices:
