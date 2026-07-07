@@ -1039,13 +1039,19 @@ def save_local_output(
     return run_dir
 
 
-def save_token_usage_metadata(output_dir: Path | None = None) -> Path:
-    """Write per-model token totals to ``output/metadata.json``.
+def save_token_usage_metadata(
+    output_dir: Path | None = None,
+    storage: BaseStorage | None = None,
+) -> Path:
+    """Persist per-model token totals to ``metadata.json``.
 
     Summarises the process-wide :data:`TOKEN_USAGE` tracker — input/output/total
-    tokens and call count for every model used this run, plus a grand total —
-    into a single ``metadata.json`` at the root of the output folder. Overwritten
-    each time so it always reflects the latest cumulative usage.
+    tokens and call count for every model used this run, plus a grand total.
+    Always written locally to ``output/metadata.json``; in production it's also
+    uploaded to the storage bucket root so the running total lives alongside the
+    conversations. Overwritten each time so it always reflects the latest
+    cumulative usage. Best-effort: a storage-upload failure is swallowed (a
+    metadata write must never abort a run).
     """
     root = output_dir or OUTPUT_DIR
     root.mkdir(parents=True, exist_ok=True)
@@ -1058,6 +1064,13 @@ def save_token_usage_metadata(output_dir: Path | None = None) -> Path:
         json.dumps(summary, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+    if storage is not None:
+        try:
+            storage.save_token_usage(summary)
+        except StorageError as err:
+            Logger.warning(f"Failed to upload token usage metadata to storage: {err}")
+
     return meta_path
 
 
@@ -1140,7 +1153,19 @@ def process_instance(
                 checkpoint,
                 reason="API rate-limit or quota exceeded",
             )
+            # Persist token usage consumed up to the failure point too.
+            try:
+                save_token_usage_metadata(storage=storage)
+            except OSError as meta_err:
+                Logger.warning(f"Failed to write token usage metadata: {meta_err}")
             raise
+
+        # Refresh the running token-usage totals after every conversation
+        # (tokens are spent whether or not it passes validation).
+        try:
+            save_token_usage_metadata(storage=storage)
+        except OSError as meta_err:
+            Logger.warning(f"Failed to write token usage metadata: {meta_err}")
 
         manual_report = result.get("manual_validation")
         duration = getattr(manual_report, "duration_sec", None)
@@ -1491,14 +1516,14 @@ def main(argv: list[str] | None = None) -> None:
                 "Resume later from the saved checkpoint."
             )
             try:
-                save_token_usage_metadata()
+                save_token_usage_metadata(storage=storage)
             except OSError as err:
                 Logger.warning(f"Failed to write token usage metadata: {err}")
             return
 
     Logger.divider()
     try:
-        meta_path = save_token_usage_metadata()
+        meta_path = save_token_usage_metadata(storage=storage)
         totals = TOKEN_USAGE.as_dict()["total"]
         Logger.success(
             f"Token usage written → {meta_path} "

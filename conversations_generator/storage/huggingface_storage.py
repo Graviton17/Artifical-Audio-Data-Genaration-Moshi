@@ -146,6 +146,12 @@ class HuggingFaceStorage(BaseStorage):
         return f"{_BUCKET_PREFIX}{self.bucket_id}/{path_in_bucket}"
 
     # ------------------------------------------------------------------ #
+    # Token usage
+    # ------------------------------------------------------------------ #
+    def save_token_usage(self, summary: dict[str, Any]) -> None:
+        self._upload_json(self.TOKEN_USAGE_NAME, summary)
+
+    # ------------------------------------------------------------------ #
     # Checkpoint
     # ------------------------------------------------------------------ #
     def load_checkpoint(self) -> Checkpoint:

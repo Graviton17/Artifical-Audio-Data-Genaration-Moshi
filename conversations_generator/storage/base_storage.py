@@ -39,6 +39,9 @@ class BaseStorage(ABC):
     #: File name of the abandoned-instance registry at the bucket root.
     SKIPPED_NAME = "skipped.json"
 
+    #: File name of the per-model token-usage summary at the bucket root.
+    TOKEN_USAGE_NAME = "metadata.json"
+
     @staticmethod
     def language_folder(language: str | None) -> str:
         """Top-level folder grouping conversations by language.
@@ -83,6 +86,12 @@ class BaseStorage(ABC):
     @abstractmethod
     def save_checkpoint(self, checkpoint: Checkpoint) -> None:
         """Write the root ``checkpoint.json`` (overwriting any prior state)."""
+        raise NotImplementedError
+
+    @abstractmethod
+    def save_token_usage(self, summary: dict[str, Any]) -> None:
+        """Write the per-model token-usage summary to the bucket root
+        (``metadata.json``), overwriting any prior version."""
         raise NotImplementedError
 
     @abstractmethod
