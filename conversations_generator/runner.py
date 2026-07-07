@@ -56,12 +56,14 @@ from .configuration_reader import (
     get_agent_temperature,
     get_mode,
     get_number_inclusion_percentage,
+    get_run_languages,
     is_production,
 )
 from .llm import (
     APILimitError,
     DEFAULT_GENERATION_PROVIDER,
     DEFAULT_VALIDATION_PROVIDER,
+    TOKEN_USAGE,
     BaseLLM,
     LLMError,
     LLMProvider,
@@ -992,6 +994,12 @@ def save_local_output(
 ) -> Path:
     """Write an accepted conversation under ``output/<run_id>/``.
 
+    Conversations are grouped by language: the run folder lands under
+    ``output/<language>/<run_id>/`` (e.g. ``output/english/…``,
+    ``output/hindi/…``, ``output/hinglish/…``), so each instance is stored in
+    the folder for the language it belongs to. An unknown/blank language falls
+    back to ``unknown``.
+
     Creates:
     * ``conversation.json`` — full payload (profile, topic, turns, …)
     * ``metadata.txt`` — title, duration, turn-type counts, retries, scores
@@ -1000,8 +1008,11 @@ def save_local_output(
     Returns the run folder path.
     """
     root = output_dir or OUTPUT_DIR
+    # Group by language so english/hindi/hinglish conversations each land in
+    # their own top-level folder. Normalise to a lowercase, filesystem-safe name.
+    language = (instance.language or "unknown").strip().lower() or "unknown"
     run_id = _make_run_id(instance, index)
-    run_dir = root / run_id
+    run_dir = root / language / run_id
     run_dir.mkdir(parents=True, exist_ok=True)
 
     payload = _conversation_payload(instance, index, result)
@@ -1026,6 +1037,28 @@ def save_local_output(
         (run_dir / "transcript.txt").write_text(transcript, encoding="utf-8")
 
     return run_dir
+
+
+def save_token_usage_metadata(output_dir: Path | None = None) -> Path:
+    """Write per-model token totals to ``output/metadata.json``.
+
+    Summarises the process-wide :data:`TOKEN_USAGE` tracker — input/output/total
+    tokens and call count for every model used this run, plus a grand total —
+    into a single ``metadata.json`` at the root of the output folder. Overwritten
+    each time so it always reflects the latest cumulative usage.
+    """
+    root = output_dir or OUTPUT_DIR
+    root.mkdir(parents=True, exist_ok=True)
+
+    summary = TOKEN_USAGE.as_dict()
+    summary["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
+
+    meta_path = root / "metadata.json"
+    meta_path.write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return meta_path
 
 
 def process_instance(
@@ -1204,6 +1237,27 @@ def process_instance(
     return progress.generated_sec
 
 
+def _language_ordered_positions(
+    corpus_df: Any,
+    run_languages: list[str] | None,
+) -> list[int]:
+    """Positional row indices to process, grouped by the requested language order.
+
+    With ``run_languages=["english", "hindi"]`` every English instance comes
+    first (in corpus order), then every Hindi one — so a run can finish one
+    language before starting the next. ``run_languages=None`` returns every row
+    in its original corpus order. Matching is case-insensitive on the corpus's
+    ``language`` column.
+    """
+    if run_languages is None:
+        return list(range(len(corpus_df)))
+    lang_of = corpus_df["language"].str.lower()
+    positions: list[int] = []
+    for lang in run_languages:
+        positions.extend(pos for pos in range(len(corpus_df)) if lang_of.iloc[pos] == lang)
+    return positions
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     provider_choices = [p.value for p in LLMProvider]
     parser = argparse.ArgumentParser(
@@ -1317,15 +1371,28 @@ def main(argv: list[str] | None = None) -> None:
     corpus_path = Path(__file__).resolve().parent / "data" / "corpus_instances.jsonl"
     corpus_df = read_corpus_instances(str(corpus_path))
 
+    # Which languages to run this session, in order. A single ``--language`` on the
+    # CLI always wins; otherwise ``RUN_LANGUAGES`` in config.json decides (a list
+    # like ["hindi", "english"]); if neither is set, every language is processed.
+    # Because the checkpoint tracks progress per instance, re-listing a language
+    # that was only partly finished last run just resumes its unfinished instances.
     if args.language:
-        mask = corpus_df["language"].str.lower() == args.language
-        corpus_df = corpus_df[mask].reset_index(drop=True)
-        if corpus_df.empty:
-            Logger.error(f"No corpus instances found for language={args.language!r}.")
+        run_languages: list[str] | None = [args.language]
+    else:
+        run_languages = get_run_languages()
+
+    if run_languages is not None:
+        invalid = [lang for lang in run_languages if lang not in SUPPORTED_LANGUAGES]
+        if invalid:
+            Logger.error(
+                f"Unsupported language(s) requested: {invalid}. "
+                f"Choose from {list(SUPPORTED_LANGUAGES)} via --language or "
+                "config.json 'RUN_LANGUAGES'."
+            )
             return
-        Logger.step(
-            f"Filtered corpus to language={args.language!r}: {len(corpus_df)} instance(s)."
-        )
+        Logger.step(f"Languages this run (in order): {run_languages}")
+    else:
+        Logger.step("No language filter — processing every language in the corpus.")
 
     hindi_note = "" if args.model else " (Hindi defaults to sarvam when --model is omitted)"
     Logger.info(
@@ -1346,7 +1413,6 @@ def main(argv: list[str] | None = None) -> None:
     # chases each instance's full duration target.
     max_conversations: int | None = None
     if production:
-        Logger.step(f"PRODUCTION run — processing all {len(corpus_df)} instances in sequence.")
         storage = HuggingFaceStorage()
         checkpoint = storage.load_checkpoint()
         Logger.info(f"Loaded checkpoint with {len(checkpoint.instances)} instance record(s).")
@@ -1354,13 +1420,18 @@ def main(argv: list[str] | None = None) -> None:
         Logger.info(
             f"Loaded skipped registry with {len(skipped.instances)} abandoned instance(s)."
         )
-        indices = range(len(corpus_df))
+        # Process every instance of each requested language in turn (English
+        # fully, then Hindi, …). Resume is automatic: an instance already at its
+        # duration target in the checkpoint is a no-op, so re-running a language
+        # only finishes the instances left over from a previous run.
+        indices = _language_ordered_positions(corpus_df, run_languages)
+        Logger.step(
+            f"PRODUCTION run — processing {len(indices)} instance(s) in sequence."
+        )
     else:
         Logger.step("DEVELOPMENT run — generating a single conversation per instance (no upload).")
-        # Without a language filter, keep the original hand-picked indices for
-        # variety across the full corpus; with a filter, just take the first
-        # few rows of the (already language-scoped) corpus.
-        indices = [
+        # Hand-picked smoke tests spanning every language for variety.
+        smoke_indices = [
             # --- original smoke tests ---
             234,   # English  | FM | user West accent | Neutral/Sad
             0,     # Hinglish | FM | Normal           | Neutral/Neutral (baseline)
@@ -1379,7 +1450,25 @@ def main(argv: list[str] | None = None) -> None:
             2882,  # English  | FM | West both         | Happy/Neutral
             2563,  # English  | MM | Bengali/Punjabi   | Neutral/Angry (mixed accents)
         ]
+        # Honour the requested languages (and their order) even in dev by keeping
+        # only the matching smoke tests, grouped by the run-language order.
+        if run_languages is not None:
+            lang_of = corpus_df["language"].str.lower()
+            indices = [
+                pos
+                for lang in run_languages
+                for pos in smoke_indices
+                if lang_of.iloc[pos] == lang
+            ]
+        else:
+            indices = smoke_indices
         max_conversations = 1
+
+    if not indices:
+        Logger.error(
+            f"No corpus instances to process for languages {run_languages}. Nothing to do."
+        )
+        return
 
     for i in indices:
         row: dict[str, Any] = {str(k): v for k, v in corpus_df.iloc[i].to_dict().items()}
@@ -1401,9 +1490,23 @@ def main(argv: list[str] | None = None) -> None:
                 "Terminating run: API rate-limit or quota exceeded. "
                 "Resume later from the saved checkpoint."
             )
+            try:
+                save_token_usage_metadata()
+            except OSError as err:
+                Logger.warning(f"Failed to write token usage metadata: {err}")
             return
 
     Logger.divider()
+    try:
+        meta_path = save_token_usage_metadata()
+        totals = TOKEN_USAGE.as_dict()["total"]
+        Logger.success(
+            f"Token usage written → {meta_path} "
+            f"(total {totals['total_tokens']} tokens across {totals['calls']} call(s))."
+        )
+    except OSError as err:
+        Logger.warning(f"Failed to write token usage metadata: {err}")
+
     Logger.success("All requested instances processed.", bold=True)
 
 

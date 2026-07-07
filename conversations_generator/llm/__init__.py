@@ -1,6 +1,15 @@
 """LLM abstraction layer for the conversation-generation agents."""
 
-from .base_llm import APILimitError, BaseLLM, LLMError, LLMResponse, Message, is_api_limit_error
+from .base_llm import (
+    TOKEN_USAGE,
+    APILimitError,
+    BaseLLM,
+    LLMError,
+    LLMResponse,
+    Message,
+    TokenUsageTracker,
+    is_api_limit_error,
+)
 from .factory import (
     DEFAULT_GENERATION_PROVIDER,
     DEFAULT_VALIDATION_PROVIDER,
@@ -22,6 +31,8 @@ __all__ = [
     "is_api_limit_error",
     "LLMResponse",
     "Message",
+    "TOKEN_USAGE",
+    "TokenUsageTracker",
     "LLMProvider",
     "DEFAULT_GENERATION_PROVIDER",
     "DEFAULT_VALIDATION_PROVIDER",

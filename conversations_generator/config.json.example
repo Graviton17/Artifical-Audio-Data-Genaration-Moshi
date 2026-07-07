@@ -9,6 +9,7 @@
   "LANGFUSE_PUBLIC_KEY": "pk-lf-your_langfuse_public",
   "LANGFUSE_BASE_URL": "https://jp.cloud.langfuse.com",
   "MODE": "prod",
+  "RUN_LANGUAGES": [],
   "HF_TOKEN": "hf_your_huggingface_token",
   "HF_BUCKET": "hf://buckets/Graviton17/artificial-data-conversation",
   "TEMPERATURE": 0.3,

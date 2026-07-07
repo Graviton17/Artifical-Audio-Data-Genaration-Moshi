@@ -127,6 +127,37 @@ def get_number_inclusion_percentage(default: float = 0.5) -> float:
     return max(0.0, min(1.0, pct))
 
 
+def get_run_languages() -> list[str] | None:
+    """Languages to process on this run, in order, from ``config.json``.
+
+    Reads the ``RUN_LANGUAGES`` key — a list like ``["english"]`` or
+    ``["hindi", "english"]`` (a bare string ``"english"`` is also accepted).
+    Names are lowercased and de-duplicated while preserving order. Returns
+    ``None`` when the key is missing or empty, meaning "process every language"
+    (the previous default behaviour).
+
+    Because the checkpoint tracks progress per instance, listing a language that
+    was already partly done on an earlier run simply resumes its unfinished
+    instances — e.g. run ``["english"]`` first, then ``["hindi", "english"]``
+    finishes the remaining English instances and does all of Hindi.
+    """
+    value = get_raw("RUN_LANGUAGES", None)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        value = [value]
+    if not isinstance(value, list):
+        return None
+    seen: set[str] = set()
+    langs: list[str] = []
+    for item in value:
+        name = str(item).strip().lower()
+        if name and name not in seen:
+            seen.add(name)
+            langs.append(name)
+    return langs or None
+
+
 def get_agent_temperature(agent: str, default: float | None = None) -> float:
     """Return the configured sampling temperature for a specific agent.
 

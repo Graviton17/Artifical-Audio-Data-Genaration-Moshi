@@ -30,6 +30,66 @@ class LLMResponse:
     raw: Any = None
 
 
+@dataclass
+class _ModelUsage:
+    """Running token totals for a single model."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
+    calls: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "total_tokens": self.total_tokens,
+            "calls": self.calls,
+        }
+
+
+class TokenUsageTracker:
+    """Process-wide accumulator of token usage, keyed by model name.
+
+    Every :class:`BaseLLM` call records the provider-reported ``usage`` here, so
+    the runner can dump a per-model token summary at the end of a run. Streaming
+    calls that don't report usage simply contribute nothing.
+    """
+
+    def __init__(self) -> None:
+        self._by_model: dict[str, _ModelUsage] = {}
+
+    def record(self, model: str, usage: dict[str, int] | None) -> None:
+        if not usage:
+            return
+        entry = self._by_model.setdefault(model, _ModelUsage())
+        entry.input_tokens += int(usage.get("input", 0) or 0)
+        entry.output_tokens += int(usage.get("output", 0) or 0)
+        entry.calls += 1
+
+    def as_dict(self) -> dict[str, Any]:
+        """Serializable summary: per-model totals plus a grand total."""
+        models = {model: usage.as_dict() for model, usage in self._by_model.items()}
+        total = {
+            "input_tokens": sum(u.input_tokens for u in self._by_model.values()),
+            "output_tokens": sum(u.output_tokens for u in self._by_model.values()),
+            "total_tokens": sum(u.total_tokens for u in self._by_model.values()),
+            "calls": sum(u.calls for u in self._by_model.values()),
+        }
+        return {"models": models, "total": total}
+
+    def reset(self) -> None:
+        self._by_model.clear()
+
+
+# Single shared tracker for the whole process. Agents call through BaseLLM, which
+# records into this; the runner reads it to write output/metadata.json.
+TOKEN_USAGE = TokenUsageTracker()
+
+
 class LLMError(RuntimeError):
     """Raised when a provider call fails after exhausting retries."""
 
@@ -126,7 +186,9 @@ class BaseLLM(ABC):
         last_err: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                return self._complete(messages, **overrides).text
+                response = self._complete(messages, **overrides)
+                TOKEN_USAGE.record(response.model or self.model, response.usage)
+                return response.text
             except Exception as err:  # noqa: BLE001 - normalized into LLMError below
                 _reraise_if_api_limit(err)
                 last_err = err
@@ -237,7 +299,9 @@ class BaseLLM(ABC):
         falls back to a single non-streamed call and yields the whole text
         as one chunk, so streaming is always safe to call.
         """
-        yield self._complete(messages, **overrides).text
+        response = self._complete(messages, **overrides)
+        TOKEN_USAGE.record(response.model or self.model, response.usage)
+        yield response.text
 
     # ------------------------------------------------------------------ #
     # Helpers
