@@ -86,6 +86,30 @@ class TopicGeneratorAgent(BaseAgent):
         """Forget previously generated topics."""
         self.history.clear()
 
+    def prime(self, topics: list[str] | list[dict[str, str]]) -> None:
+        """Reset history and seed it with previously-generated topics.
+
+        Called at the start of each instance (including on resume from a
+        checkpoint) so the "do NOT repeat" list already contains every topic
+        produced for that instance in earlier runs — keeping newly generated
+        topics distinct instead of restarting from an empty history. Accepts
+        either plain title strings or full topic dicts.
+        """
+        self.history = []
+        for topic in topics:
+            if isinstance(topic, str):
+                title = topic.strip()
+                if title:
+                    self.history.append({"title": title, "context": ""})
+            elif isinstance(topic, dict) and str(topic.get("title", "")).strip():
+                self.history.append(
+                    {
+                        "title": str(topic["title"]).strip(),
+                        "context": str(topic.get("context", "")).strip(),
+                        "conversation_type": topic.get("conversation_type", "unknown"),
+                    }
+                )
+
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #

@@ -22,6 +22,10 @@ class InstanceProgress:
     target_sec: float
     generated_sec: float = 0.0
     conversation_count: int = 0
+    # Titles of every topic already generated for this instance. Persisted so a
+    # resuming run can seed the topic generator and keep producing NEW topics
+    # instead of repeating ones from a previous run.
+    topics: list[str] = field(default_factory=list)
 
     @property
     def completed(self) -> bool:
@@ -34,6 +38,7 @@ class InstanceProgress:
             "target_sec": self.target_sec,
             "generated_sec": self.generated_sec,
             "conversation_count": self.conversation_count,
+            "topics": self.topics,
             "completed": self.completed,
         }
 
@@ -44,6 +49,7 @@ class InstanceProgress:
             target_sec=raw.get("target_sec", 0.0),
             generated_sec=raw.get("generated_sec", 0.0),
             conversation_count=raw.get("conversation_count", 0),
+            topics=list(raw.get("topics") or []),
         )
 
 
@@ -71,10 +77,21 @@ class Checkpoint:
             )
         return self.instances[key]
 
-    def record(self, progress: InstanceProgress, added_sec: float) -> None:
-        """Add one accepted conversation's duration to an instance and stamp time."""
+    def record(
+        self,
+        progress: InstanceProgress,
+        added_sec: float,
+        topic_title: str | None = None,
+    ) -> None:
+        """Add one accepted conversation's duration to an instance and stamp time.
+
+        ``topic_title`` (when given) is appended to the instance's topic history
+        so a later resume can avoid regenerating it.
+        """
         progress.generated_sec += added_sec
         progress.conversation_count += 1
+        if topic_title:
+            progress.topics.append(topic_title)
         self.instances[str(progress.corpus_combination_id)] = progress
         self.updated_at = datetime.now(timezone.utc).isoformat()
 

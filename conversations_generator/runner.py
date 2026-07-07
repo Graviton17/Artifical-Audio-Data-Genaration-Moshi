@@ -1127,6 +1127,16 @@ def process_instance(
             f"across {progress.conversation_count} conversation(s)."
         )
 
+    # Seed the topic generator with this instance's already-generated topics so
+    # it keeps producing NEW ones — both across instances in this run and, on a
+    # resume, across previous runs (topic titles are persisted in the checkpoint).
+    runner.topic_agent.prime(progress.topics)
+    if progress.topics:
+        Logger.info(
+            f"Primed topic generator with {len(progress.topics)} prior topic(s) "
+            "to avoid repeats."
+        )
+
     # Continue numbering after whatever's already recorded so we never overwrite
     # a conversation a previous machine uploaded.
     index = progress.conversation_count
@@ -1214,6 +1224,7 @@ def process_instance(
 
         consecutive_failures = 0
         accepted += 1
+        topic_title = (result.get("topic") or {}).get("title") or None
 
         # Development only: dump accepted conversations under output/<run_id>/.
         if not is_production():
@@ -1234,7 +1245,7 @@ def process_instance(
                     index,
                     _conversation_payload(instance, index, result),
                 )
-                checkpoint.record(progress, duration)
+                checkpoint.record(progress, duration, topic_title=topic_title)
                 storage.save_checkpoint(checkpoint)
             except StorageError as err:
                 Logger.error(f"Storage failure on conversation {index}, aborting instance: {err}")
@@ -1248,6 +1259,8 @@ def process_instance(
             # Development: count locally, don't upload to the remote bucket.
             progress.generated_sec += duration
             progress.conversation_count += 1
+            if topic_title:
+                progress.topics.append(topic_title)
             Logger.success(
                 f"Conversation {index} accepted (+{duration:.0f}s) — "
                 f"total {progress.generated_sec:.0f}/{target_sec:.0f}s",
