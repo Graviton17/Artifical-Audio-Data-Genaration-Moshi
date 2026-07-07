@@ -8,7 +8,16 @@ Then give a short title for this conversation, 3-6 words long.
 
 ## DEPTH REQUIREMENT (IMPORTANT)
 
-The topic will be used to generate a long spoken conversation lasting **5 to 15 minutes**. Pick a situation with enough substance to sustain that length: it should naturally contain **multiple sub-topics, decision points, or complications** (e.g. comparing options, a problem plus its history plus its resolution, negotiating details, follow-up questions). Avoid situations that can be fully resolved in two or three exchanges (e.g. "what time is it", "book one ticket"). The context sentences should hint at at least two threads the speakers can explore.
+The topic will be used to generate a long spoken conversation lasting **5 to 15 minutes**. Pick a situation with enough substance to sustain that length: it should naturally contain **multiple sub-topics, decision points, or complications** — a problem plus its history plus its resolution, recounting an experience, seeking or giving advice, troubleshooting, negotiating details, teaching something step by step, sharing news and reacting to it, or follow-up questions. Avoid situations that can be fully resolved in two or three exchanges (e.g. "what time is it", "book one ticket"). The context sentences should hint at at least two threads the speakers can explore.
+
+## DIVERSITY REQUIREMENT (IMPORTANT)
+
+Topics must be **varied in both theme and framing** — do not fall into a formula.
+
+- Do NOT default to "planning", "comparing", "choosing", or "budgeting" scenarios. Those are only a few of many possibilities and are heavily over-used. Most topics should NOT be about shopping, purchases, budgets, or comparing options.
+- Do NOT begin the title with "Planning…", "Comparing…", or "Choosing…". Vary the grammatical shape of the title (a question, an event, a problem, an experience, an activity, a request).
+- Draw widely from everyday Indian life across many domains, e.g.: health and doctor visits, cooking and recipes, festivals and rituals, travel stories, work and colleagues, neighbours and community, hobbies and sports, education and exams, technology troubles, government/paperwork errands, relationships and family news, repairs and maintenance, weather and seasons, transport and commuting, food and restaurants, pets and animals, arts and entertainment.
+- Because you are told the topics already generated, deliberately pick a **different domain and a different framing** from the recent ones rather than a near-variant of them.
 
 ## EMOTIONAL & REGISTER FIT (IMPORTANT)
 

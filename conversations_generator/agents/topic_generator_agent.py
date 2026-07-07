@@ -22,6 +22,38 @@ CONVERSATION_TYPES: list[str] = [
     "Emotion",
 ]
 
+# Everyday-life domains, one picked at random per topic. Seeding each call with a
+# concrete area is what actually produces variety: without it, feeding the model
+# the list of past topics makes it IMITATE them (few-shot anchoring) and cluster
+# on the same "planning / comparing" mould. A random domain steers each topic
+# into a genuinely different corner of life instead.
+TOPIC_DOMAINS: list[str] = [
+    "health, illness, doctor visits, or medicine",
+    "cooking, recipes, or a specific dish",
+    "a festival, ritual, or religious observance",
+    "a travel story or trip that already happened",
+    "work, a job, colleagues, or the workplace",
+    "neighbours, housing society, or the local community",
+    "a hobby, sport, or game",
+    "school, college, exams, or studies",
+    "a technology or gadget problem",
+    "a government office, paperwork, or a document errand",
+    "family news, relationships, or a personal milestone",
+    "a household repair, appliance, or maintenance issue",
+    "weather, seasons, or a natural event",
+    "commuting, public transport, or a vehicle",
+    "food, a restaurant, or eating out",
+    "pets or animals",
+    "movies, music, TV, or entertainment",
+    "money matters like a bill, salary, or a bank issue",
+    "clothes, a wedding, or a social event",
+    "fitness, exercise, or daily routine",
+    "gardening, plants, or the home garden",
+    "a childhood or nostalgic memory",
+    "helping someone with a decision or a piece of advice",
+    "a misunderstanding, complaint, or dispute to resolve",
+]
+
 
 class TopicGeneratorAgent(BaseAgent):
     """Generate conversation topics one per call, avoiding past repeats."""
@@ -55,6 +87,9 @@ class TopicGeneratorAgent(BaseAgent):
         """
         # Pick a random conversation type if none was explicitly provided.
         chosen_type = conversation_type or random.choice(CONVERSATION_TYPES)
+        # Seed this topic with a random everyday-life domain, avoiding the ones
+        # used most recently so consecutive topics land in different areas.
+        chosen_domain = self._pick_domain()
 
         prompt = self._build_prompt(
             language=language,
@@ -64,6 +99,7 @@ class TopicGeneratorAgent(BaseAgent):
             user_accent=user_accent,
             gender_pair=gender_pair,
             include_numbers=include_numbers,
+            domain=chosen_domain,
         )
 
         system_vars = {"conversation_type": chosen_type}
@@ -79,8 +115,21 @@ class TopicGeneratorAgent(BaseAgent):
             )
         )
         topic["conversation_type"] = chosen_type  # track which type was used
+        topic["domain"] = chosen_domain  # track which domain seeded it
         self.history.append(topic)
         return topic
+
+    def _pick_domain(self) -> str:
+        """Choose a domain, avoiding those used in the most recent topics.
+
+        Excludes the domains of roughly the last half-list of topics so the same
+        area isn't reused back-to-back; falls back to the full list once every
+        domain has been used recently.
+        """
+        window = min(len(TOPIC_DOMAINS) - 1, len(self.history))
+        recent = {t.get("domain") for t in self.history[-window:]} if window else set()
+        candidates = [d for d in TOPIC_DOMAINS if d not in recent]
+        return random.choice(candidates or TOPIC_DOMAINS)
 
     def reset(self) -> None:
         """Forget previously generated topics."""
@@ -123,19 +172,31 @@ class TopicGeneratorAgent(BaseAgent):
         user_accent: str | None = None,
         gender_pair: str | None = None,
         include_numbers: bool = False,
+        domain: str | None = None,
     ) -> str:
         lines = [
             "Generate ONE new conversation topic.",
             f"Language of the conversations: {language}.",
         ]
+        if domain:
+            lines.append(
+                f"Set this conversation firmly in this area of everyday life: {domain}. "
+                "Invent a specific, concrete situation within that area — do not drift "
+                "into shopping, budgeting, or comparing options unless that area is "
+                "itself about money."
+            )
         if include_numbers:
             lines.append(
                 "This topic MUST be one where concrete numbers naturally come up "
-                "and can be discussed with reasoning — e.g. prices/budgets, dates "
-                "and durations, quantities, percentages/discounts, measurements, "
-                "ages, scores, distances, or phone/order/account numbers. Pick a "
-                "title and context that clearly invite specific figures (and the "
-                "explanation/comparison around them) during the conversation."
+                "and can be discussed with reasoning. Numbers arise in MANY kinds "
+                "of situations — do NOT default to prices, budgets, or comparing "
+                "costs. Draw the numeric element from a wide range, e.g. dates and "
+                "durations, a medicine dosage or schedule, cooking quantities and "
+                "timings, a travel itinerary or distances, exam marks or scores, "
+                "measurements, ages, a match result, quantities of things, or "
+                "phone/order/account numbers. Pick a title and context that invite "
+                "specific figures during the conversation WITHOUT making the topic "
+                "about shopping, budgeting, or price comparison."
             )
         else:
             lines.append(
@@ -163,8 +224,11 @@ class TopicGeneratorAgent(BaseAgent):
                 "Topics already generated (do NOT repeat, closely resemble, "
                 "or use a similar theme/setting/scenario as any of these):\n"
                 f"{already}\n"
-                "IMPORTANT: Ensure maximum diversity in the themes, settings, and scenarios. "
-                "Avoid clustering around any single domain."
+                "IMPORTANT: Ensure maximum diversity in themes, settings, scenarios, "
+                "AND title framing. Pick a different domain from the ones above, and "
+                "vary the sentence shape of the title — do NOT keep starting titles "
+                "with 'Planning', 'Comparing', or 'Choosing', and avoid clustering "
+                "around shopping, budgets, or comparing options."
             )
 
         lines.append(
