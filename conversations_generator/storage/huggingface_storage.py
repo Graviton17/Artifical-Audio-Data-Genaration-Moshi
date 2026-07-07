@@ -40,6 +40,12 @@ from .checkpoint import Checkpoint
 from .disk_cache import ControlFileCache
 from .skipped import SkippedRegistry
 
+# Declared as ``Any`` so the ``None`` import fallback below doesn't make type
+# checkers flag the guarded call sites as "Object of type None cannot be called".
+batch_bucket_files: Any
+create_bucket: Any
+download_bucket_files: Any
+
 try:  # Lazy-ish import so the package works without the SDK installed.
     from huggingface_hub import (
         batch_bucket_files,

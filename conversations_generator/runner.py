@@ -90,9 +90,7 @@ from .models import CorpusInstance
 from .usage_tracker import UsageTracker, usage_context
 from .token_stats import (
     ModelInfo,
-    legacy_krutrim_models,
     models_metadata_lines,
-    patch_hf_model_metadata,
     print_token_stats,
 )
 from .storage import (
@@ -1792,8 +1790,8 @@ def main(argv: list[str] | None = None) -> None:
     max_conversations: int | None = None
     if production:
         Logger.step(
-            f"PRODUCTION run — processing corpus instances "
-            f"(bucket layout: <language>/instance_<id>/conversation_<n>/)."
+            "PRODUCTION run — processing corpus instances "
+            "(bucket layout: <language>/instance_<id>/conversation_<n>/)."
         )
         storage = HuggingFaceStorage()
         scope_languages = _languages_in_scope(corpus_df, args.language)

@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,6 +18,12 @@ from .configuration_reader import (
 )
 from .logger import BOLD, DIM, RESET
 from .storage.base_storage import BaseStorage, SUPPORTED_LANGUAGE_FOLDERS
+
+# Declared as ``Any`` so the ``None`` import fallback below doesn't make type
+# checkers flag the guarded call sites as "Object of type None cannot be called".
+batch_bucket_files: Any
+download_bucket_files: Any
+list_bucket_tree: Any
 
 try:
     from huggingface_hub import batch_bucket_files, download_bucket_files, list_bucket_tree
