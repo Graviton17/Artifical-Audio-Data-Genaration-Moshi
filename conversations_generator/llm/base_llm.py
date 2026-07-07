@@ -166,6 +166,10 @@ class BaseLLM(ABC):
         self.max_tokens = max_tokens
         self.max_retries = max_retries
         self.retry_backoff = retry_backoff
+        # Token usage from the most recent streaming call. Providers populate this
+        # inside ``_complete_stream`` (the streamed text yields no return value),
+        # and ``generate_stream`` records it into ``TOKEN_USAGE`` afterwards.
+        self._last_stream_usage: dict[str, int] = {}
 
     # ------------------------------------------------------------------ #
     # Public API used by agents
@@ -218,12 +222,17 @@ class BaseLLM(ABC):
         for attempt in range(1, self.max_retries + 1):
             try:
                 chunks: list[str] = []
+                # Reset so a stream that reports no usage doesn't inherit the
+                # previous call's numbers.
+                self._last_stream_usage = {}
                 for chunk in self._complete_stream(messages, **overrides):
                     if not chunk:
                         continue
                     chunks.append(chunk)
                     if on_chunk is not None:
                         on_chunk(chunk)
+                # Record whatever usage the provider captured during the stream.
+                TOKEN_USAGE.record(self.model, self._last_stream_usage)
                 return "".join(chunks)
             except Exception as err:  # noqa: BLE001 - normalized into LLMError below
                 _reraise_if_api_limit(err)
@@ -338,6 +347,40 @@ class BaseLLM(ABC):
                 event = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+            choices = event.get("choices") or []
+            if not choices:
+                continue
+            delta = (choices[0].get("delta") or {}).get("content")
+            if delta:
+                yield delta
+
+    def _iter_sse_content_with_usage(self, lines: Iterator[bytes | str]) -> Iterator[str]:
+        """Like :meth:`_iter_sse_content`, but also capture the stream's usage.
+
+        OpenAI-style streams (Sarvam, Krutrim, Inception) emit a trailing
+        ``data: {... "usage": {...}}`` event when the request asks for it
+        (``stream_options={"include_usage": true}``). This records that usage
+        into ``self._last_stream_usage`` so streamed calls count toward the
+        per-model token totals, while yielding content deltas exactly as before.
+        """
+        for line in lines:
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", errors="replace")
+            if not line or not line.startswith("data:"):
+                continue
+            payload = line[len("data:"):].strip()
+            if not payload or payload == "[DONE]":
+                continue
+            try:
+                event = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            usage = event.get("usage")
+            if usage:
+                self._last_stream_usage = {
+                    "input": usage.get("prompt_tokens", 0) or 0,
+                    "output": usage.get("completion_tokens", 0) or 0,
+                }
             choices = event.get("choices") or []
             if not choices:
                 continue

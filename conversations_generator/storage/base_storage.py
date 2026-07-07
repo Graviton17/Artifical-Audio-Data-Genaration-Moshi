@@ -10,10 +10,11 @@ Layout contract every backend must honor::
     <bucket root>/
         checkpoint.json                     # resume state (root level)
         skipped.json                         # instances abandoned after N failures
-        instance_<id>/                       # one folder per corpus instance
-            conversation_0001.json
-            conversation_0002.json
-            ...
+        <language>/                          # english / hindi / hinglish
+            instance_<id>/                   # one folder per corpus instance
+                conversation_0001.json
+                conversation_0002.json
+                ...
 """
 
 from __future__ import annotations
@@ -37,6 +38,16 @@ class BaseStorage(ABC):
 
     #: File name of the abandoned-instance registry at the bucket root.
     SKIPPED_NAME = "skipped.json"
+
+    @staticmethod
+    def language_folder(language: str | None) -> str:
+        """Top-level folder grouping conversations by language.
+
+        Normalised to a lowercase, filesystem-safe name (e.g. ``english``,
+        ``hindi``, ``hinglish``); a blank/unknown language falls back to
+        ``unknown``.
+        """
+        return (language or "unknown").strip().lower() or "unknown"
 
     @staticmethod
     def instance_folder(corpus_combination_id: int) -> str:

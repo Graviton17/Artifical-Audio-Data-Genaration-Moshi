@@ -121,6 +121,11 @@ class GeminiLLM(BaseLLM):
             contents=contents,
             config=config,
         ):
+            # Gemini reports cumulative usage_metadata on chunks; keep the latest
+            # so streamed calls count toward the per-model token totals.
+            usage = self._usage(chunk)
+            if usage:
+                self._last_stream_usage = usage
             if chunk.text:
                 yield chunk.text
 

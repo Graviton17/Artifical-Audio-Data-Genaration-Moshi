@@ -14,9 +14,10 @@ Bucket layout::
     hf://buckets/<ns>/<name>/
         checkpoint.json
         skipped.json
-        instance_0001/conversation_0001.json
-        instance_0001/conversation_0002.json
-        instance_0002/conversation_0001.json
+        english/instance_0001/conversation_0001.json
+        english/instance_0001/conversation_0002.json
+        hindi/instance_0135/conversation_0001.json
+        hinglish/instance_0005/conversation_0001.json
         ...
 """
 
@@ -132,7 +133,12 @@ class HuggingFaceStorage(BaseStorage):
         index: int,
         payload: dict[str, Any],
     ) -> str:
+        # Group by language: <language>/instance_<id>/conversation_<index>.json,
+        # so English/Hindi/Hinglish conversations each land in their own folder.
+        # The language comes from the payload's profile (falls back to "unknown").
+        language = self.language_folder((payload.get("profile") or {}).get("language"))
         path_in_bucket = (
+            f"{language}/"
             f"{self.instance_folder(corpus_combination_id)}/"
             f"{self.conversation_name(index)}"
         )

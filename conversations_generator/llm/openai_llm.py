@@ -80,6 +80,9 @@ class OpenAILLM(BaseLLM):
             "messages": messages,
             "temperature": params["temperature"],
             "stream": True,
+            # Emit a final usage-only chunk so streamed calls count toward the
+            # per-model token totals.
+            "stream_options": {"include_usage": True},
         }
         if params["max_tokens"] is not None:
             kwargs["max_tokens"] = params["max_tokens"]
@@ -87,6 +90,10 @@ class OpenAILLM(BaseLLM):
             kwargs["response_format"] = overrides["response_format"]
 
         for event in self._client.chat.completions.create(**kwargs):
+            # The trailing usage chunk has empty choices but a populated usage.
+            usage = self._usage(event)
+            if usage:
+                self._last_stream_usage = usage
             delta = event.choices[0].delta.content if event.choices else None
             if delta:
                 yield delta

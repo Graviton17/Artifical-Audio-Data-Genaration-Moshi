@@ -93,6 +93,9 @@ class KrutrimLLM(BaseLLM):
             "messages": messages,
             "temperature": params["temperature"],
             "stream": True,
+            # Ask the OpenAI-compatible stream to emit a final usage event so
+            # streamed calls still contribute to the per-model token totals.
+            "stream_options": {"include_usage": True},
         }
         if params["max_tokens"] is not None:
             payload["max_tokens"] = params["max_tokens"]
@@ -113,7 +116,7 @@ class KrutrimLLM(BaseLLM):
         # The SSE stream carries UTF-8, but the server sends no charset, so
         # requests would otherwise guess ISO-8859-1 and mangle Devanagari.
         response.encoding = "utf-8"
-        yield from self._iter_sse_content(
+        yield from self._iter_sse_content_with_usage(
             response.iter_lines(decode_unicode=True)
         )
 
