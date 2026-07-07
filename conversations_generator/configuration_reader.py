@@ -127,6 +127,23 @@ def get_number_inclusion_percentage(default: float = 0.5) -> float:
     return max(0.0, min(1.0, pct))
 
 
+def get_num_workers(default: int = 1) -> int:
+    """Number of parallel worker threads for conversation generation.
+
+    Read from ``config.json``'s ``NUM_WORKERS``. Each worker generates a separate
+    conversation for the current instance concurrently, so a multi-hour instance
+    finishes faster. Topic generation stays serialised internally so parallel
+    workers never produce the same topic. Values below 1 are treated as 1
+    (sequential), and non-integer/invalid values fall back to ``default``.
+    """
+    value = get_raw("NUM_WORKERS", default)
+    try:
+        workers = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(1, workers)
+
+
 def get_run_languages() -> list[str] | None:
     """Languages to process on this run, in order, from ``config.json``.
 

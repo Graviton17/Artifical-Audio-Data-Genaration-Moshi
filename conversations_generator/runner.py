@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -55,6 +56,7 @@ from .configuration_reader import (
     apply_to_environ,
     get_agent_temperature,
     get_mode,
+    get_num_workers,
     get_number_inclusion_percentage,
     get_run_languages,
     is_production,
@@ -833,6 +835,10 @@ MAX_CONSECUTIVE_FAILURES = 10
 # Layout: <repo>/output/<run_id>/conversation.json + metadata.txt
 OUTPUT_DIR = Path(__file__).resolve().parent.parent / "output"
 
+# Serialises the token-usage metadata write, which parallel workers all trigger
+# after each conversation — without it two threads could interleave the file.
+_TOKEN_METADATA_LOCK = threading.Lock()
+
 
 def _save_checkpoint_before_shutdown(
     storage: BaseStorage | None,
@@ -1054,24 +1060,66 @@ def save_token_usage_metadata(
     metadata write must never abort a run).
     """
     root = output_dir or OUTPUT_DIR
-    root.mkdir(parents=True, exist_ok=True)
 
-    summary = TOKEN_USAGE.as_dict()
-    summary["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
+    # Snapshot + write under a lock so concurrent workers don't interleave the
+    # file or upload inconsistent snapshots.
+    with _TOKEN_METADATA_LOCK:
+        root.mkdir(parents=True, exist_ok=True)
+        summary = TOKEN_USAGE.as_dict()
+        summary["generated_at_utc"] = datetime.now(timezone.utc).isoformat()
 
-    meta_path = root / "metadata.json"
-    meta_path.write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+        meta_path = root / "metadata.json"
+        meta_path.write_text(
+            json.dumps(summary, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
 
-    if storage is not None:
-        try:
-            storage.save_token_usage(summary)
-        except StorageError as err:
-            Logger.warning(f"Failed to upload token usage metadata to storage: {err}")
+        if storage is not None:
+            try:
+                storage.save_token_usage(summary)
+            except StorageError as err:
+                Logger.warning(f"Failed to upload token usage metadata to storage: {err}")
 
     return meta_path
+
+
+def _record_skipped_instance(
+    storage: BaseStorage | None,
+    skipped: SkippedRegistry | None,
+    instance: CorpusInstance,
+    progress: InstanceProgress,
+    target_sec: float,
+    consecutive_failures: int,
+) -> None:
+    """Record an abandoned instance in the bucket-root ``skipped.json``.
+
+    Best-effort and production-only: a storage failure here must not crash the
+    run, so it's logged and swallowed.
+    """
+    if storage is None or skipped is None:
+        return
+    try:
+        skipped.add(
+            SkippedInstance(
+                corpus_combination_id=instance.corpus_combination_id,
+                consecutive_failures=consecutive_failures,
+                reason=f"{MAX_CONSECUTIVE_FAILURES} consecutive validation failures",
+                generated_sec=progress.generated_sec,
+                target_sec=target_sec,
+                conversation_count=progress.conversation_count,
+                language=instance.language,
+                gender_pair=instance.gender_pair,
+            )
+        )
+        storage.save_skipped(skipped)
+        Logger.warning(
+            f"Recorded instance {instance.corpus_combination_id} in "
+            f"{storage.SKIPPED_NAME} (bucket root)."
+        )
+    except StorageError as err:
+        Logger.error(
+            f"Failed to record skipped instance {instance.corpus_combination_id}: {err}"
+        )
 
 
 def process_instance(
@@ -1137,135 +1185,165 @@ def process_instance(
             "to avoid repeats."
         )
 
-    # Continue numbering after whatever's already recorded so we never overwrite
-    # a conversation a previous machine uploaded.
-    index = progress.conversation_count
-    consecutive_failures = 0
-    accepted = 0  # conversations accepted this run (for the max_conversations cap)
-
-    while progress.generated_sec < target_sec:
-        if max_conversations is not None and accepted >= max_conversations:
-            break
-        index += 1
-        Logger.divider()
+    # How many conversations to generate concurrently. 1 == the old sequential
+    # behaviour; N spins up N worker threads that each generate a conversation
+    # for THIS instance at the same time. Topic generation is serialised inside
+    # the topic agent, so parallel workers never produce a clashing topic.
+    workers = get_num_workers()
+    if workers > 1:
         Logger.info(
-            f"Instance {instance.corpus_combination_id} — conversation {index} "
-            f"(progress {progress.generated_sec:.0f}/{target_sec:.0f}s, "
-            f"{progress.generated_sec / target_sec * 100 if target_sec else 0:.1f}%)"
+            f"Parallel generation: {workers} worker(s) for instance "
+            f"{instance.corpus_combination_id}."
         )
 
-        try:
-            result = runner.run(**instance.to_profile())
-        except APILimitError as err:
-            Logger.error(f"API limit hit during conversation {index}: {err}")
-            _save_checkpoint_before_shutdown(
-                storage,
-                checkpoint,
-                reason="API rate-limit or quota exceeded",
-            )
-            # Persist token usage consumed up to the failure point too.
+    # Shared state mutated by every worker, guarded by ``lock``. ``stop`` signals
+    # all workers to wind down (target met, abort, API limit, or storage error).
+    lock = threading.Lock()
+    stop = threading.Event()
+    shared: dict[str, Any] = {
+        "accepted": 0,             # accepted this run (for the max_conversations cap)
+        "consecutive_failures": 0, # across workers; trips the abort guard
+        "api_limit_err": None,     # set → re-raised after workers join
+    }
+
+    def _should_start() -> bool:
+        """Whether a worker may begin another conversation (checked under lock)."""
+        if stop.is_set() or progress.generated_sec >= target_sec:
+            return False
+        if max_conversations is not None and shared["accepted"] >= max_conversations:
+            return False
+        return True
+
+    def worker(worker_id: int) -> None:
+        while True:
+            with lock:
+                if not _should_start():
+                    return
+
+            # Heavy pipeline runs OUTSIDE the lock so workers overlap; only the
+            # topic step is internally serialised (guaranteeing unique topics).
+            try:
+                result = runner.run(**instance.to_profile())
+            except APILimitError as err:
+                with lock:
+                    shared["api_limit_err"] = err
+                    stop.set()
+                Logger.error(f"API limit hit (worker {worker_id}): {err}")
+                _save_checkpoint_before_shutdown(
+                    storage, checkpoint, reason="API rate-limit or quota exceeded"
+                )
+                try:
+                    save_token_usage_metadata(storage=storage)
+                except OSError:
+                    pass
+                return
+
+            # Tokens are spent whether or not the conversation passes; refresh the
+            # running totals (the tracker + writer are thread-safe).
             try:
                 save_token_usage_metadata(storage=storage)
             except OSError as meta_err:
                 Logger.warning(f"Failed to write token usage metadata: {meta_err}")
-            raise
 
-        # Refresh the running token-usage totals after every conversation
-        # (tokens are spent whether or not it passes validation).
-        try:
-            save_token_usage_metadata(storage=storage)
-        except OSError as meta_err:
-            Logger.warning(f"Failed to write token usage metadata: {meta_err}")
+            manual_report = result.get("manual_validation")
+            duration = getattr(manual_report, "duration_sec", None)
 
-        manual_report = result.get("manual_validation")
-        duration = getattr(manual_report, "duration_sec", None)
-
-        if not result.get("passed") or not duration:
-            consecutive_failures += 1
-            Logger.error(
-                f"Conversation {index} failed validation "
-                f"(consecutive failures: {consecutive_failures}/{MAX_CONSECUTIVE_FAILURES})."
-            )
-            if consecutive_failures >= MAX_CONSECUTIVE_FAILURES:
+            # ---- failed validation ----
+            if not result.get("passed") or not duration:
+                abort = False
+                with lock:
+                    shared["consecutive_failures"] += 1
+                    cf = shared["consecutive_failures"]
+                    if cf >= MAX_CONSECUTIVE_FAILURES and not stop.is_set():
+                        stop.set()
+                        abort = True
                 Logger.error(
-                    f"Aborting instance {instance.corpus_combination_id}: "
-                    f"{MAX_CONSECUTIVE_FAILURES} consecutive failures."
+                    f"Conversation failed validation (worker {worker_id}; "
+                    f"consecutive failures: {cf}/{MAX_CONSECUTIVE_FAILURES})."
                 )
-                # Production only: record the abandoned instance in the bucket's
-                # root skipped.json so it's audited and skipped on resume instead
-                # of burning another 10 attempts on it. Best-effort — a storage
-                # failure here must not crash the whole run.
-                if storage is not None and skipped is not None:
+                if abort:
+                    Logger.error(
+                        f"Aborting instance {instance.corpus_combination_id}: "
+                        f"{MAX_CONSECUTIVE_FAILURES} consecutive failures."
+                    )
+                    _record_skipped_instance(
+                        storage, skipped, instance, progress, target_sec, cf
+                    )
+                    return
+                continue
+
+            # ---- accepted ----
+            topic_title = (result.get("topic") or {}).get("title") or None
+            with lock:
+                # A late abort/limit may have fired while we were generating; if so,
+                # drop this result rather than recording past the stop point.
+                if stop.is_set():
+                    return
+                # Assign the file index atomically from the persisted count so
+                # parallel saves never collide or leave gaps.
+                index = progress.conversation_count + 1
+
+                if storage is not None and checkpoint is not None:
+                    # Upload the conversation, THEN advance + persist the checkpoint,
+                    # so a crash between the two just regenerates it.
                     try:
-                        skipped.add(
-                            SkippedInstance(
-                                corpus_combination_id=instance.corpus_combination_id,
-                                consecutive_failures=consecutive_failures,
-                                reason=f"{MAX_CONSECUTIVE_FAILURES} consecutive validation failures",
-                                generated_sec=progress.generated_sec,
-                                target_sec=target_sec,
-                                conversation_count=progress.conversation_count,
-                                language=instance.language,
-                                gender_pair=instance.gender_pair,
-                            )
+                        path = storage.save_conversation(
+                            instance.corpus_combination_id,
+                            index,
+                            _conversation_payload(instance, index, result),
                         )
-                        storage.save_skipped(skipped)
-                        Logger.warning(
-                            f"Recorded instance {instance.corpus_combination_id} in "
-                            f"{storage.SKIPPED_NAME} (bucket root)."
-                        )
+                        checkpoint.record(progress, duration, topic_title=topic_title)
+                        storage.save_checkpoint(checkpoint)
                     except StorageError as err:
                         Logger.error(
-                            f"Failed to record skipped instance "
-                            f"{instance.corpus_combination_id}: {err}"
+                            f"Storage failure on conversation {index}, aborting instance: {err}"
                         )
-                break
-            continue
+                        stop.set()
+                        return
+                    Logger.success(
+                        f"Saved {path} (+{duration:.0f}s) — "
+                        f"total {progress.generated_sec:.0f}/{target_sec:.0f}s",
+                        bold=True,
+                    )
+                else:
+                    # Development: dump locally and count in memory, no upload.
+                    if not is_production():
+                        try:
+                            local_dir = save_local_output(instance, index, result)
+                            Logger.success(f"Wrote local output → {local_dir}")
+                        except OSError as err:
+                            Logger.warning(
+                                f"Failed to write local output for conversation {index}: {err}"
+                            )
+                    progress.generated_sec += duration
+                    progress.conversation_count += 1
+                    if topic_title:
+                        progress.topics.append(topic_title)
+                    Logger.success(
+                        f"Conversation {index} accepted (+{duration:.0f}s) — "
+                        f"total {progress.generated_sec:.0f}/{target_sec:.0f}s",
+                        bold=True,
+                    )
 
-        consecutive_failures = 0
-        accepted += 1
-        topic_title = (result.get("topic") or {}).get("title") or None
+                shared["consecutive_failures"] = 0
+                shared["accepted"] += 1
 
-        # Development only: dump accepted conversations under output/<run_id>/.
-        if not is_production():
-            try:
-                local_dir = save_local_output(instance, index, result)
-                Logger.success(f"Wrote local output → {local_dir}")
-            except OSError as err:
-                Logger.warning(f"Failed to write local output for conversation {index}: {err}")
+    if workers == 1:
+        worker(1)
+    else:
+        threads = [
+            threading.Thread(target=worker, args=(wid,), name=f"gen-worker-{wid}")
+            for wid in range(1, workers + 1)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
 
-        if storage is not None and checkpoint is not None:
-            # Upload the conversation, THEN advance + persist the checkpoint. The
-            # conversation lands in the bucket before the checkpoint claims it,
-            # so a crash between the two just regenerates it — the checkpoint
-            # never points at a missing file.
-            try:
-                path = storage.save_conversation(
-                    instance.corpus_combination_id,
-                    index,
-                    _conversation_payload(instance, index, result),
-                )
-                checkpoint.record(progress, duration, topic_title=topic_title)
-                storage.save_checkpoint(checkpoint)
-            except StorageError as err:
-                Logger.error(f"Storage failure on conversation {index}, aborting instance: {err}")
-                break
-            Logger.success(
-                f"Saved {path} (+{duration:.0f}s) — "
-                f"total {progress.generated_sec:.0f}/{target_sec:.0f}s",
-                bold=True,
-            )
-        else:
-            # Development: count locally, don't upload to the remote bucket.
-            progress.generated_sec += duration
-            progress.conversation_count += 1
-            if topic_title:
-                progress.topics.append(topic_title)
-            Logger.success(
-                f"Conversation {index} accepted (+{duration:.0f}s) — "
-                f"total {progress.generated_sec:.0f}/{target_sec:.0f}s",
-                bold=True,
-            )
+    # An API-limit hit inside any worker must terminate the whole run (main saves
+    # the checkpoint and stops); re-raise it now that all workers have stopped.
+    if shared["api_limit_err"] is not None:
+        raise shared["api_limit_err"]
 
     Logger.success(
         f"Instance {instance.corpus_combination_id} complete: "

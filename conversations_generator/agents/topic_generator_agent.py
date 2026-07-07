@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import threading
 from typing import Any
 
 from ..llm import BaseLLM
@@ -65,6 +66,10 @@ class TopicGeneratorAgent(BaseAgent):
         super().__init__(llm)
         # Topics produced so far this session; fed back to avoid repeats.
         self.history: list[dict[str, str]] = []
+        # Serialises topic generation so parallel workers never produce the same
+        # topic: the whole "read history → generate → append" step is atomic, so
+        # each worker sees every topic chosen before it and adds a distinct one.
+        self._lock = threading.Lock()
 
     def run(
         self,
@@ -85,38 +90,43 @@ class TopicGeneratorAgent(BaseAgent):
         numbers naturally come up in the conversation (see the runner, which
         toggles this per-conversation from ``NUMBER_INCLUSION_PERCENTAGE``).
         """
-        # Pick a random conversation type if none was explicitly provided.
-        chosen_type = conversation_type or random.choice(CONVERSATION_TYPES)
-        # Seed this topic with a random everyday-life domain, avoiding the ones
-        # used most recently so consecutive topics land in different areas.
-        chosen_domain = self._pick_domain()
-
-        prompt = self._build_prompt(
-            language=language,
-            agent_emotion=agent_emotion,
-            user_emotion=user_emotion,
-            agent_accent=agent_accent,
-            user_accent=user_accent,
-            gender_pair=gender_pair,
-            include_numbers=include_numbers,
-            domain=chosen_domain,
-        )
-
-        system_vars = {"conversation_type": chosen_type}
-
         overrides.setdefault("response_format", {"type": "json_object"})
-        topic = self._normalize(
-            self._generate_json(
-                prompt,
-                system_vars=system_vars,
-                stream=True,
-                stream_label=f"Generating topic ({language})…",
-                **overrides,
+        # Hold the lock across the whole read→generate→append so concurrent
+        # workers can't pick the same domain/history snapshot and collide. Topic
+        # generation is a small slice of the pipeline, so serialising just this
+        # step barely dents the parallel speed-up while guaranteeing uniqueness.
+        with self._lock:
+            # Pick a random conversation type if none was explicitly provided.
+            chosen_type = conversation_type or random.choice(CONVERSATION_TYPES)
+            # Seed this topic with a random everyday-life domain, avoiding the ones
+            # used most recently so consecutive topics land in different areas.
+            chosen_domain = self._pick_domain()
+
+            prompt = self._build_prompt(
+                language=language,
+                agent_emotion=agent_emotion,
+                user_emotion=user_emotion,
+                agent_accent=agent_accent,
+                user_accent=user_accent,
+                gender_pair=gender_pair,
+                include_numbers=include_numbers,
+                domain=chosen_domain,
             )
-        )
-        topic["conversation_type"] = chosen_type  # track which type was used
-        topic["domain"] = chosen_domain  # track which domain seeded it
-        self.history.append(topic)
+
+            system_vars = {"conversation_type": chosen_type}
+
+            topic = self._normalize(
+                self._generate_json(
+                    prompt,
+                    system_vars=system_vars,
+                    stream=True,
+                    stream_label=f"Generating topic ({language})…",
+                    **overrides,
+                )
+            )
+            topic["conversation_type"] = chosen_type  # track which type was used
+            topic["domain"] = chosen_domain  # track which domain seeded it
+            self.history.append(topic)
         return topic
 
     def _pick_domain(self) -> str:

@@ -8,6 +8,7 @@ of any vendor SDK details.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -61,28 +62,33 @@ class TokenUsageTracker:
 
     def __init__(self) -> None:
         self._by_model: dict[str, _ModelUsage] = {}
+        # Guards the dict against concurrent updates from parallel workers.
+        self._lock = threading.Lock()
 
     def record(self, model: str, usage: dict[str, int] | None) -> None:
         if not usage:
             return
-        entry = self._by_model.setdefault(model, _ModelUsage())
-        entry.input_tokens += int(usage.get("input", 0) or 0)
-        entry.output_tokens += int(usage.get("output", 0) or 0)
-        entry.calls += 1
+        with self._lock:
+            entry = self._by_model.setdefault(model, _ModelUsage())
+            entry.input_tokens += int(usage.get("input", 0) or 0)
+            entry.output_tokens += int(usage.get("output", 0) or 0)
+            entry.calls += 1
 
     def as_dict(self) -> dict[str, Any]:
         """Serializable summary: per-model totals plus a grand total."""
-        models = {model: usage.as_dict() for model, usage in self._by_model.items()}
-        total = {
-            "input_tokens": sum(u.input_tokens for u in self._by_model.values()),
-            "output_tokens": sum(u.output_tokens for u in self._by_model.values()),
-            "total_tokens": sum(u.total_tokens for u in self._by_model.values()),
-            "calls": sum(u.calls for u in self._by_model.values()),
-        }
+        with self._lock:
+            models = {model: usage.as_dict() for model, usage in self._by_model.items()}
+            total = {
+                "input_tokens": sum(u.input_tokens for u in self._by_model.values()),
+                "output_tokens": sum(u.output_tokens for u in self._by_model.values()),
+                "total_tokens": sum(u.total_tokens for u in self._by_model.values()),
+                "calls": sum(u.calls for u in self._by_model.values()),
+            }
         return {"models": models, "total": total}
 
     def reset(self) -> None:
-        self._by_model.clear()
+        with self._lock:
+            self._by_model.clear()
 
 
 # Single shared tracker for the whole process. Agents call through BaseLLM, which
@@ -169,7 +175,17 @@ class BaseLLM(ABC):
         # Token usage from the most recent streaming call. Providers populate this
         # inside ``_complete_stream`` (the streamed text yields no return value),
         # and ``generate_stream`` records it into ``TOKEN_USAGE`` afterwards.
-        self._last_stream_usage: dict[str, int] = {}
+        # Backed by thread-local storage so parallel workers sharing one LLM
+        # instance don't clobber each other's in-flight usage.
+        self._stream_usage_local = threading.local()
+
+    @property
+    def _last_stream_usage(self) -> dict[str, int]:
+        return getattr(self._stream_usage_local, "value", {}) or {}
+
+    @_last_stream_usage.setter
+    def _last_stream_usage(self, value: dict[str, int]) -> None:
+        self._stream_usage_local.value = value
 
     # ------------------------------------------------------------------ #
     # Public API used by agents
