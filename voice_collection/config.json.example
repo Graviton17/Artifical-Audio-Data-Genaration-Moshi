@@ -1,0 +1,26 @@
+{
+  "HF_TOKEN": "hf_your_huggingface_token",
+  "HF_BUCKET": "hf://buckets/inavlabs/voice_collection",
+  "HF_BUCKET_PRIVATE": true,
+  "HF_BUCKET_CREATE": true,
+  "STORAGE_PROVIDER": "huggingface",
+  "UPLOAD_ENABLED": true,
+  "LOCAL_OUTPUT_DIR": "./output/voice_collection",
+  "TARGET_DURATION_SECONDS": 10,
+  "MIN_ACCEPTABLE_DURATION_SECONDS": 5,
+  "TARGET_SAMPLE_RATE": 16000,
+  "MAX_SPEAKERS_PER_LANGUAGE": null,
+  "ANONYMIZE_SPEAKER_NAMES": false,
+  "LOG_LEVEL": "INFO",
+  "DATASETS": {
+    "english": {
+      "repo_id": "ai4bharat/Svarah",
+      "split": "test"
+    },
+    "hindi": {
+      "repo_id": "ai4bharat/indicvoices_r",
+      "split": "train",
+      "data_dir": "Hindi"
+    }
+  }
+}
