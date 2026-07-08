@@ -103,7 +103,10 @@ class OpenAILLM(BaseLLM):
         usage = getattr(response, "usage", None)
         if not usage:
             return {}
+        details = getattr(usage, "prompt_tokens_details", None)
+        cached = getattr(details, "cached_tokens", 0) if details else 0
         return {
             "input": getattr(usage, "prompt_tokens", 0) or 0,
             "output": getattr(usage, "completion_tokens", 0) or 0,
+            "cache": cached or 0,
         }

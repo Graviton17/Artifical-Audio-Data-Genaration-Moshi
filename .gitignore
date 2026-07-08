@@ -11,3 +11,4 @@ dataset/*.jsonl
 conversations_generator/config.json
 voice_collection/config.json
 output/
+wandb/

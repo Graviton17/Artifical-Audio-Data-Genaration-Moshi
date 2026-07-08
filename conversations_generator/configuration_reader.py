@@ -144,6 +144,25 @@ def get_num_workers(default: int = 1) -> int:
     return max(1, workers)
 
 
+def get_max_concurrent_api_calls(default: int = 0) -> int:
+    """Maximum number of outbound LLM API calls allowed in flight at once.
+
+    Read from ``config.json``'s ``MAX_CONCURRENT_API_CALLS``. This is
+    independent of ``NUM_WORKERS``: many worker threads can check
+    instance/language budgets and plan work concurrently (cheap, no network
+    call), but actual requests to the LLM provider are throttled to this many
+    concurrent calls process-wide — protecting against provider-side rate
+    limits when ``NUM_WORKERS`` is set very high (e.g. 1000). ``0`` (or
+    unset/invalid) means unlimited — no throttling, the previous behaviour.
+    """
+    value = get_raw("MAX_CONCURRENT_API_CALLS", default)
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0, n)
+
+
 def get_run_languages() -> list[str] | None:
     """Languages to process on this run, in order, from ``config.json``.
 
@@ -232,8 +251,11 @@ def apply_to_environ() -> dict[str, Any]:
     pick up values this way. Explicit ``os.environ`` entries always win.
     """
     cfg = load_config()
+    # W&B keys use entity/project syntax in config.json; wandb_logger splits
+    # them before touching os.environ / calling wandb.init().
+    _skip_env_keys = frozenset({"WANDB_PROJECT", "WANDB_API_KEY", "WANDB_ENABLED"})
     for key, value in cfg.items():
-        if value:
+        if value and key not in _skip_env_keys:
             os.environ.setdefault(key, value)
     # Langfuse Python SDK historically reads LANGFUSE_HOST; mirror BASE_URL if set.
     base_url = cfg.get("LANGFUSE_BASE_URL") or cfg.get("LANGFUSE_HOST")

@@ -28,3 +28,6 @@ huggingface_hub>=1.5.0   # bucket API: create_bucket / batch_bucket_files / down
 # voice_collection (Svarah + IndicVoices-R speaker harvesting)
 datasets>=2.18
 scipy>=1.11
+
+# Metrics (token usage + conversation/instance progress dashboards)
+wandb>=0.17
