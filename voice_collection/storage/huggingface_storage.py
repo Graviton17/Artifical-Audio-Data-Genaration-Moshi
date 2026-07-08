@@ -28,8 +28,9 @@ _BUCKET_PREFIX = "hf://buckets/"
 _UPLOAD_BATCH_SIZE = 100
 
 try:
-    from huggingface_hub import batch_bucket_files, create_bucket
+    from huggingface_hub import HfApi, batch_bucket_files, create_bucket
 except ImportError:  # pragma: no cover
+    HfApi = None
     batch_bucket_files = None
     create_bucket = None
 
@@ -66,6 +67,7 @@ class HuggingFaceStorage(BaseStorage):
                 "(needs a WRITE token with access to the bucket namespace)."
             )
         os.environ.setdefault("HF_TOKEN", self.token)
+        self._api = HfApi(token=self.token)
 
         if create:
             self._ensure_bucket(private)
@@ -88,6 +90,14 @@ class HuggingFaceStorage(BaseStorage):
         file_paths = sorted(path for path in local_root.rglob("*") if path.is_file())
         if not file_paths:
             logger.warning("No files found under %s; nothing to upload.", local_root)
+            return 0
+
+        existing_remote = self.list_remote_files(prefix)
+        file_paths = [
+            path for path in file_paths if path.relative_to(local_root).as_posix() not in existing_remote
+        ]
+        if not file_paths:
+            logger.info("All files under %s already exist in hf://buckets/%s/%s", local_root, self.bucket_id, prefix)
             return 0
 
         uploaded = 0
@@ -118,3 +128,28 @@ class HuggingFaceStorage(BaseStorage):
             prefix or "",
         )
         return uploaded
+
+    def list_remote_files(self, remote_prefix: str) -> set[str]:
+        prefix = remote_prefix.strip("/")
+        try:
+            items = self._api.list_bucket_tree(self.bucket_id, prefix=prefix or None, recursive=True)
+        except Exception as err:  # noqa: BLE001
+            raise StorageError(
+                f"Failed to list files in hf://buckets/{self.bucket_id}/{prefix}: {err}"
+            ) from err
+
+        existing: set[str] = set()
+        for item in items:
+            path = getattr(item, "path", None)
+            if not path:
+                continue
+            if prefix:
+                if path == prefix:
+                    existing.add(path.rsplit("/", 1)[-1])
+                    continue
+                if not path.startswith(prefix + "/"):
+                    continue
+                existing.add(path[len(prefix) + 1 :])
+            else:
+                existing.add(path)
+        return existing

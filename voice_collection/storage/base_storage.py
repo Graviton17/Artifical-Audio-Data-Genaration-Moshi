@@ -27,3 +27,12 @@ class BaseStorage(ABC):
         Returns the number of files uploaded.
         """
         raise NotImplementedError
+
+    @abstractmethod
+    def list_remote_files(self, remote_prefix: str) -> set[str]:
+        """Return file paths that already exist under ``remote_prefix``.
+
+        Paths are returned relative to ``remote_prefix`` so callers can compare
+        them directly to ``local_root.rglob(...)`` relative paths.
+        """
+        raise NotImplementedError

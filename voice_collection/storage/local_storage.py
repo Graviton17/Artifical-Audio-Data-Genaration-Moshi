@@ -34,9 +34,21 @@ class LocalStorage(BaseStorage):
             if file_path.is_dir():
                 continue
             target = destination / file_path.relative_to(local_root)
+            if target.exists():
+                continue
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(file_path, target)
             count += 1
 
         logger.info("Copied %d file(s) to %s", count, destination)
         return count
+
+    def list_remote_files(self, remote_prefix: str) -> set[str]:
+        destination = self.destination_root / remote_prefix
+        if not destination.exists():
+            return set()
+        return {
+            path.relative_to(destination).as_posix()
+            for path in destination.rglob("*")
+            if path.is_file()
+        }
