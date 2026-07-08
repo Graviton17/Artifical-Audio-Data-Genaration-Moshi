@@ -9,5 +9,6 @@ dataset/*.jsonl
 .env
 # Local secrets — copy from config.json.example and fill in real keys.
 conversations_generator/config.json
+voice_collection/config.json
 output/
 wandb/
