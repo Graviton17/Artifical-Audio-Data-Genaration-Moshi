@@ -134,3 +134,69 @@ def test_write_report_creates_manifest_json(tmp_path):
         "gender_breakdown": {"male": 1},
         "uploaded_file_count": 0,
     }
+
+
+def test_has_complete_local_export_requires_manifest_and_matching_speaker_count(tmp_path):
+    pipeline = VoiceCollectionPipeline.__new__(VoiceCollectionPipeline)
+    pipeline.output_root = tmp_path
+    pipeline.max_speakers = None
+
+    report = VoiceCollectionPipeline._build_report(
+        "english",
+        _SelectorStub(seen_speaker_count=2),
+        {
+            "speaker_a": _selection(
+                "speaker_a",
+                gender=Gender.MALE,
+                duration_seconds=10.0,
+                tier=SelectionTier.PRIMARY,
+            ),
+            "speaker_b": _selection(
+                "speaker_b",
+                gender=Gender.FEMALE,
+                duration_seconds=7.5,
+                tier=SelectionTier.FALLBACK,
+            ),
+        },
+    )
+
+    assert pipeline._has_complete_local_export("english", report) is False
+
+    for gender, speaker in (("male", "speaker_a"), ("female", "speaker_b")):
+        speaker_dir = tmp_path / "english" / gender / speaker
+        speaker_dir.mkdir(parents=True)
+        (speaker_dir / "audio.wav").write_bytes(b"a")
+        (speaker_dir / "metadata.json").write_text("{}", encoding="utf-8")
+
+    assert pipeline._has_complete_local_export("english", report) is True
+
+
+def test_load_existing_report_round_trips_summary(tmp_path):
+    pipeline = VoiceCollectionPipeline.__new__(VoiceCollectionPipeline)
+    pipeline.output_root = tmp_path
+
+    manifests_dir = tmp_path / "_manifests"
+    manifests_dir.mkdir(parents=True)
+    (manifests_dir / "english_summary.json").write_text(
+        json.dumps(
+            {
+                "language": "english",
+                "speakers_seen": 4,
+                "speakers_selected": 2,
+                "speakers_discarded": 2,
+                "primary_tier_count": 1,
+                "fallback_tier_count": 1,
+                "total_selected_duration_seconds": 18.5,
+                "gender_breakdown": {"male": 1, "female": 1},
+                "uploaded_file_count": 3,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = pipeline._load_existing_report("english")
+
+    assert report is not None
+    assert report.language is Language.ENGLISH
+    assert report.speakers_selected == 2
+    assert report.uploaded_file_count == 3

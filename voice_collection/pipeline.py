@@ -46,29 +46,34 @@ class VoiceCollectionPipeline:
     def run(self, language: str, *, upload: bool = True) -> PipelineReport:
         Logger.step(f"Starting voice-collection pipeline for '{language}'")
 
-        dataset_config = config.get_dataset_config(language)
-        dataset_config.setdefault("hf_token", config.get_hf_token())
-        source = DatasetSourceFactory.create(language, dataset_config)
+        report = self._load_existing_report(language)
+        if self._has_complete_local_export(language, report):
+            Logger.info(f"Found complete local export for '{language}'. Skipping dataset processing and export.")
+        else:
+            dataset_config = config.get_dataset_config(language)
+            dataset_config.setdefault("hf_token", config.get_hf_token())
+            source = DatasetSourceFactory.create(language, dataset_config)
 
-        selector = SpeakerAudioSelector(self.target_duration, self.min_acceptable_duration)
-        Logger.info(f"Streaming '{dataset_config['repo_id']}' (this can take a while for large datasets)...")
-        for count, sample in enumerate(source.stream(), start=1):
-            selector.offer(sample)
-            if count % _PROGRESS_EVERY == 0:
-                Logger.info(
-                    f"Processed {count} instance(s) | speakers seen: {selector.seen_speaker_count} | "
-                    f"qualified so far: {len(selector.selected)}"
-                )
+            selector = SpeakerAudioSelector(self.target_duration, self.min_acceptable_duration)
+            Logger.info(f"Streaming '{dataset_config['repo_id']}' (this can take a while for large datasets)...")
+            for count, sample in enumerate(source.stream(), start=1):
+                selector.offer(sample)
+                if count % _PROGRESS_EVERY == 0:
+                    Logger.info(
+                        f"Processed {count} instance(s) | speakers seen: {selector.seen_speaker_count} | "
+                        f"qualified so far: {len(selector.selected)}"
+                    )
 
-        selections = selector.selected
-        if self.max_speakers is not None:
-            selections = dict(list(selections.items())[: self.max_speakers])
+            selections = selector.selected
+            if self.max_speakers is not None:
+                selections = dict(list(selections.items())[: self.max_speakers])
 
-        Logger.step(f"Exporting {len(selections)} speaker(s) for '{language}'...")
-        exported_dirs = self.exporter.export_language(Language(language), selections)
-        Logger.success(f"Exported {len(exported_dirs)} speaker folder(s) under {self.output_root / language}")
+            Logger.step(f"Exporting {len(selections)} speaker(s) for '{language}'...")
+            exported_dirs = self.exporter.export_language(Language(language), selections)
+            Logger.success(f"Exported {len(exported_dirs)} speaker folder(s) under {self.output_root / language}")
 
-        report = self._build_report(language, selector, selections)
+            report = self._build_report(language, selector, selections)
+            self._write_report(language, report)
 
         if upload:
             report.uploaded_file_count = self._upload(language)
@@ -88,6 +93,48 @@ class VoiceCollectionPipeline:
         uploaded = storage.upload_directory(local_root, remote_prefix)
         Logger.success(f"Uploaded {uploaded} file(s) to '{bucket}/{remote_prefix}'.")
         return uploaded
+
+    def _load_existing_report(self, language: str) -> PipelineReport | None:
+        path = self.output_root / "_manifests" / f"{language}_summary.json"
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            report = PipelineReport(language=Language(payload["language"]))
+            report.speakers_seen = int(payload.get("speakers_seen", 0))
+            report.speakers_selected = int(payload.get("speakers_selected", 0))
+            report.speakers_discarded = int(payload.get("speakers_discarded", 0))
+            report.primary_tier_count = int(payload.get("primary_tier_count", 0))
+            report.fallback_tier_count = int(payload.get("fallback_tier_count", 0))
+            report.total_selected_duration_seconds = float(payload.get("total_selected_duration_seconds", 0.0))
+            report.gender_breakdown = dict(payload.get("gender_breakdown", {}))
+            report.uploaded_file_count = int(payload.get("uploaded_file_count", 0))
+            return report
+        except Exception as err:  # noqa: BLE001
+            Logger.warning(f"Could not read existing summary for '{language}': {err}")
+            return None
+
+    def _has_complete_local_export(self, language: str, report: PipelineReport | None) -> bool:
+        if report is None or self.max_speakers is not None:
+            return False
+
+        language_root = self.output_root / language
+        if not language_root.exists():
+            return False
+
+        complete_speaker_dirs = 0
+        for gender_dir in sorted(path for path in language_root.iterdir() if path.is_dir()):
+            for speaker_dir in sorted(path for path in gender_dir.iterdir() if path.is_dir()):
+                if (speaker_dir / "audio.wav").is_file() and (speaker_dir / "metadata.json").is_file():
+                    complete_speaker_dirs += 1
+
+        if complete_speaker_dirs != report.speakers_selected:
+            Logger.warning(
+                f"Local export for '{language}' looks incomplete "
+                f"({complete_speaker_dirs}/{report.speakers_selected} speaker folders complete). Recomputing."
+            )
+            return False
+        return complete_speaker_dirs > 0
 
     @staticmethod
     def _build_report(language: str, selector: SpeakerAudioSelector, selections: dict) -> PipelineReport:
