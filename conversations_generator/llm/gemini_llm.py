@@ -239,4 +239,5 @@ class GeminiLLM(BaseLLM):
             "input": getattr(meta, "prompt_token_count", 0) or 0,
             "thinking": getattr(meta, "thoughts_token_count", 0) or 0,
             "output": getattr(meta, "candidates_token_count", 0) or 0,
+            "cache": getattr(meta, "cached_content_token_count", 0) or 0,
         }

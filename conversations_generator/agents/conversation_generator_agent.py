@@ -374,13 +374,16 @@ class ConversationGeneratorAgent(BaseAgent):
         lines.extend(_accent_guidance(agent_accent, user_accent, language))
 
         if target_duration_sec is not None:
+            approx_words = int(target_duration_sec * 2.5)
+            approx_turns = max(24, int(target_duration_sec / 7))
             lines.append("")
             lines.append("## Target duration")
             lines.append(
                 f"Aim for a conversation that lasts approximately "
                 f"**{target_duration_sec:.0f} seconds** (~{target_duration_sec / 60:.1f} "
-                f"minutes) when spoken at a natural pace (~2-3 words/second). Write "
-                f"enough turns and content to fill it — do not end early."
+                f"minutes) when spoken at a natural pace (~2.5 words/second). "
+                f"Write **at least ~{approx_turns} turns** and **~{approx_words} words** "
+                f"total across both speakers — do not end early or leave long silent gaps."
             )
 
         # Number inclusion is decided per-conversation by the runner.

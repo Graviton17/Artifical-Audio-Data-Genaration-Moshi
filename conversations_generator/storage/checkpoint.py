@@ -75,6 +75,9 @@ class Checkpoint:
                 corpus_combination_id=corpus_combination_id,
                 target_sec=target_sec,
             )
+        else:
+            # Keep the corpus row as source of truth when duration targets change.
+            self.instances[key].target_sec = target_sec
         return self.instances[key]
 
     def record(
