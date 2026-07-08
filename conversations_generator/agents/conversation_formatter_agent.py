@@ -114,6 +114,8 @@ OVERLAP_OFFSET_SEC = 0.5     # fallback offset when a turn carries no join ratio
 INTERRUPT_LEAD_SEC = 0.4     # how long before the victim's end the cut-in starts
 INTERRUPT_EXTEND_SEC = 0.3   # how far past the victim's end the interrupter runs
 BACKCHANNEL_MAX_FRAC = 0.8   # a backchannel fills at most this fraction of its host
+TARGET_DURATION_MIN_SEC = 240.0   # 4 min — matches runner + manual validator
+TARGET_DURATION_MAX_SEC = 480.0   # 8 min
 
 
 class ConversationFormatterAgent(BaseAgent):
@@ -139,6 +141,7 @@ class ConversationFormatterAgent(BaseAgent):
         language: str | None = None,
         feedback: str | None = None,
         previous_output: list[dict[str, Any]] | None = None,
+        target_duration_sec: float | None = None,
         **overrides: Any,
     ) -> list[dict[str, Any]]:
         """Format ``transcript`` into a list of schema turn dicts.
@@ -189,6 +192,8 @@ class ConversationFormatterAgent(BaseAgent):
 
         parsed = self._extract_lines(raw_result)
         turns = self._assemble(parsed, agent_emotion=agent_emotion, user_emotion=user_emotion)
+        if target_duration_sec is not None:
+            turns = self.scale_timings_to_target(turns, target_duration_sec)
         return turns
 
     # ------------------------------------------------------------------ #
@@ -568,6 +573,43 @@ class ConversationFormatterAgent(BaseAgent):
         for t in turns:
             t.pop("_ref_speaker", None)
             t.pop("_ref_ratio", None)
+        return turns
+
+    @staticmethod
+    def scale_timings_to_target(
+        turns: list[dict[str, Any]],
+        target_duration_sec: float,
+    ) -> list[dict[str, Any]]:
+        """Uniformly scale planned timings so total duration matches the target.
+
+        The generator + formatter estimate duration from text length, which tends
+        to land short of the sampled 4–8 min target. Scaling preserves overlap /
+        interruption relationships while making checkpoint duration accounting
+        match the intended conversation length.
+        """
+        if not turns or target_duration_sec <= 0:
+            return turns
+
+        target = max(
+            TARGET_DURATION_MIN_SEC,
+            min(TARGET_DURATION_MAX_SEC, float(target_duration_sec)),
+        )
+        starts = [t["planned_start_sec"] for t in turns if t.get("planned_start_sec") is not None]
+        ends = [t["planned_end_sec"] for t in turns if t.get("planned_end_sec") is not None]
+        if not starts or not ends:
+            return turns
+
+        t0 = min(starts)
+        current = max(ends) - t0
+        if current <= 0:
+            return turns
+
+        scale = target / current
+        for turn in turns:
+            for field in ("planned_start_sec", "planned_end_sec"):
+                value = turn.get(field)
+                if value is not None:
+                    turn[field] = round((float(value) - t0) * scale + t0, 2)
         return turns
 
     # ------------------------------------------------------------------ #

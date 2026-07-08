@@ -7,6 +7,7 @@ of any vendor SDK details.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import threading
 import time
@@ -37,6 +38,10 @@ class _ModelUsage:
 
     input_tokens: int = 0
     output_tokens: int = 0
+    # Cached-input tokens the provider billed at a discount (prompt caching).
+    # Reported by OpenAI (`prompt_tokens_details.cached_tokens`) and Gemini
+    # (`cached_content_token_count`); providers that don't report it stay at 0.
+    cache_tokens: int = 0
     calls: int = 0
 
     @property
@@ -47,6 +52,7 @@ class _ModelUsage:
         return {
             "input_tokens": self.input_tokens,
             "output_tokens": self.output_tokens,
+            "cache_tokens": self.cache_tokens,
             "total_tokens": self.total_tokens,
             "calls": self.calls,
         }
@@ -72,6 +78,7 @@ class TokenUsageTracker:
             entry = self._by_model.setdefault(model, _ModelUsage())
             entry.input_tokens += int(usage.get("input", 0) or 0)
             entry.output_tokens += int(usage.get("output", 0) or 0)
+            entry.cache_tokens += int(usage.get("cache", 0) or 0)
             entry.calls += 1
 
     def as_dict(self) -> dict[str, Any]:
@@ -81,6 +88,7 @@ class TokenUsageTracker:
             total = {
                 "input_tokens": sum(u.input_tokens for u in self._by_model.values()),
                 "output_tokens": sum(u.output_tokens for u in self._by_model.values()),
+                "cache_tokens": sum(u.cache_tokens for u in self._by_model.values()),
                 "total_tokens": sum(u.total_tokens for u in self._by_model.values()),
                 "calls": sum(u.calls for u in self._by_model.values()),
             }
@@ -150,6 +158,48 @@ def _reraise_if_api_limit(err: Exception) -> None:
         raise APILimitError(str(err)) from err
 
 
+# ------------------------------------------------------------------ #
+# Process-wide outbound-call throttle.
+#
+# ``NUM_WORKERS`` (config.json) can be set far higher than the number of LLM
+# calls that should actually be in flight at once (e.g. 1000 worker threads
+# checking budgets, but only 12 conversations left to generate). Separately,
+# providers rate-limit on concurrent connections/RPS regardless of how many
+# local threads exist. ``MAX_CONCURRENT_API_CALLS`` throttles the ACTUAL
+# network call — every agent funnels through ``generate``/``generate_stream``
+# below, so gating those two methods covers topic, transcript, formatter, and
+# every validator call with one process-wide semaphore. Lazily built (not at
+# import time) so config.json need not exist for code that never calls an LLM.
+# ------------------------------------------------------------------ #
+_api_semaphore_lock = threading.Lock()
+_api_semaphore: threading.Semaphore | None = None
+_api_semaphore_checked = False
+
+
+def _api_call_guard() -> Any:
+    """Context manager throttling concurrent outbound LLM calls.
+
+    Returns the shared :class:`threading.Semaphore` (acquired/released via
+    ``with``) when ``MAX_CONCURRENT_API_CALLS`` is configured and positive;
+    otherwise a no-op context manager so behaviour is unchanged when unset.
+    """
+    global _api_semaphore, _api_semaphore_checked
+    if not _api_semaphore_checked:
+        with _api_semaphore_lock:
+            if not _api_semaphore_checked:
+                limit = 0
+                try:
+                    from ..configuration_reader import get_max_concurrent_api_calls
+
+                    limit = get_max_concurrent_api_calls()
+                except Exception:  # noqa: BLE001 - config missing/broken must not block LLM calls
+                    limit = 0
+                if limit > 0:
+                    _api_semaphore = threading.Semaphore(limit)
+                _api_semaphore_checked = True
+    return _api_semaphore if _api_semaphore is not None else contextlib.nullcontext()
+
+
 class BaseLLM(ABC):
     """Base class for chat-completion LLMs.
 
@@ -206,7 +256,8 @@ class BaseLLM(ABC):
         last_err: Exception | None = None
         for attempt in range(1, self.max_retries + 1):
             try:
-                response = self._complete(messages, **overrides)
+                with _api_call_guard():
+                    response = self._complete(messages, **overrides)
                 TOKEN_USAGE.record(response.model or self.model, response.usage)
                 return response.text
             except Exception as err:  # noqa: BLE001 - normalized into LLMError below
@@ -241,12 +292,13 @@ class BaseLLM(ABC):
                 # Reset so a stream that reports no usage doesn't inherit the
                 # previous call's numbers.
                 self._last_stream_usage = {}
-                for chunk in self._complete_stream(messages, **overrides):
-                    if not chunk:
-                        continue
-                    chunks.append(chunk)
-                    if on_chunk is not None:
-                        on_chunk(chunk)
+                with _api_call_guard():
+                    for chunk in self._complete_stream(messages, **overrides):
+                        if not chunk:
+                            continue
+                        chunks.append(chunk)
+                        if on_chunk is not None:
+                            on_chunk(chunk)
                 # Record whatever usage the provider captured during the stream.
                 TOKEN_USAGE.record(self.model, self._last_stream_usage)
                 return "".join(chunks)

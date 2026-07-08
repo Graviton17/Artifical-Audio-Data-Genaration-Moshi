@@ -12,6 +12,9 @@
   "RUN_LANGUAGES": [],
   "HF_TOKEN": "hf_your_huggingface_token",
   "HF_BUCKET": "hf://buckets/Graviton17/artificial-data-conversation",
+  "WANDB_API_KEY": "your_wandb_api_key",
+  "WANDB_PROJECT": "ml-team-inavlabs/Kupe-FDX-Datagen",
+  "WANDB_ENABLED": true,
   "TEMPERATURE": 0.3,
   "NUMBER_INCLUSION_PERCENTAGE": 0.65,
   "AGENT_TEMPERATURES": {

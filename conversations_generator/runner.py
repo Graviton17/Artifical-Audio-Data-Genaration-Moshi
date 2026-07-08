@@ -76,6 +76,7 @@ from .llm import (
 from .loaders import read_corpus_instances
 from .logger import Logger
 from .models import CorpusInstance
+from . import wandb_logger
 from .storage import (
     BaseStorage,
     Checkpoint,
@@ -101,6 +102,12 @@ DURATION_MAX_SEC = 8 * 60      # 480s — 8 min
 DURATION_MEAN_SEC = (DURATION_MIN_SEC + DURATION_MAX_SEC) / 2   # 360s — 6 min
 DURATION_STD_SEC = (DURATION_MAX_SEC - DURATION_MIN_SEC) / 4    # 60s — ±2σ covers the range
 
+# How far past ``instance.duration_sec`` we tolerate when accepting one conversation.
+# A single 4–8 min conversation can overshoot slightly; large overshoots are rejected.
+INSTANCE_OVERFLOW_TOLERANCE_SEC = 120.0
+# Shortest conversation we still bother generating when budget is tight.
+MIN_VIABLE_CONVERSATION_SEC = 60.0
+
 
 def sample_target_duration_sec(
     mean: float = DURATION_MEAN_SEC,
@@ -120,6 +127,131 @@ def sample_target_duration_sec(
         if low <= value <= high:
             return round(value, 1)
     return round(min(max(random.gauss(mean, std), low), high), 1)
+
+
+def cap_target_duration_for_budget(
+    sampled_sec: float,
+    remaining_sec: float,
+    *,
+    max_overflow_sec: float = INSTANCE_OVERFLOW_TOLERANCE_SEC,
+) -> float | None:
+    """Cap a sampled conversation duration so the instance stays near its target.
+
+    Called immediately after topic generation once the remaining instance budget
+    is known. When enough budget remains, the sampled 4–8 min target is kept
+    (not shrunk toward the instance tail). Returns ``None`` when there is not
+    enough budget left to generate a worthwhile conversation.
+    """
+    if remaining_sec <= 0:
+        return None
+
+    if remaining_sec >= DURATION_MIN_SEC:
+        # Normal case: honour the sampled 4–8 min target, only clip to budget.
+        ceiling = min(DURATION_MAX_SEC, remaining_sec + max_overflow_sec)
+        capped = min(max(sampled_sec, DURATION_MIN_SEC), ceiling)
+        if capped < DURATION_MIN_SEC:
+            return None
+        return round(capped, 1)
+
+    # Final tail: less than 4 min of instance budget left — allow one shorter clip.
+    if remaining_sec + max_overflow_sec < MIN_VIABLE_CONVERSATION_SEC:
+        return None
+    capped = min(sampled_sec, remaining_sec + max_overflow_sec)
+    return round(max(capped, MIN_VIABLE_CONVERSATION_SEC), 1)
+
+
+class GenerationBudget:
+    """Tracks committed + reserved seconds against instance and language caps.
+
+    Checkpoint/HF totals are the committed baseline. Each worker reserves its
+    planned conversation duration (known after topic + target sampling) so
+    parallel workers cannot collectively overshoot either limit.
+    """
+
+    def __init__(
+        self,
+        *,
+        instance_target_sec: float,
+        instance_generated_sec: float,
+        language_target_sec: float | None = None,
+        language_generated_sec: float | None = None,
+        max_overflow_sec: float = INSTANCE_OVERFLOW_TOLERANCE_SEC,
+    ) -> None:
+        self.instance_target_sec = instance_target_sec
+        self.instance_generated_sec = instance_generated_sec
+        self.language_target_sec = language_target_sec
+        self.language_generated_sec = language_generated_sec or 0.0
+        self.max_overflow_sec = max_overflow_sec
+        self._reserved: dict[str, float] = {}
+        self._next_id = 0
+
+    @property
+    def reserved_sec(self) -> float:
+        return sum(self._reserved.values())
+
+    def instance_headroom(self) -> float:
+        return (
+            self.instance_target_sec
+            + self.max_overflow_sec
+            - self.instance_generated_sec
+            - self.reserved_sec
+        )
+
+    def language_headroom(self) -> float:
+        if self.language_target_sec is None:
+            return float("inf")
+        return (
+            self.language_target_sec
+            + self.max_overflow_sec
+            - self.language_generated_sec
+            - self.reserved_sec
+        )
+
+    def effective_headroom(self) -> float:
+        return min(self.instance_headroom(), self.language_headroom())
+
+    def can_accommodate(self, planned_sec: float) -> bool:
+        if planned_sec <= 0:
+            return False
+        return planned_sec <= self.effective_headroom() + 1e-6
+
+    def reserve(self, planned_sec: float, worker_id: int) -> str | None:
+        if not self.can_accommodate(planned_sec):
+            return None
+        reservation_id = f"w{worker_id}-{self._next_id}"
+        self._next_id += 1
+        self._reserved[reservation_id] = planned_sec
+        return reservation_id
+
+    def release(self, reservation_id: str | None) -> None:
+        if reservation_id:
+            self._reserved.pop(reservation_id, None)
+
+    def commit(self, actual_sec: float) -> None:
+        self.instance_generated_sec += actual_sec
+        self.language_generated_sec += actual_sec
+
+
+def _language_budget_totals(
+    corpus_df: Any,
+    checkpoint: Checkpoint | None,
+    run_languages: list[str] | None,
+    language: str,
+) -> tuple[float, float]:
+    """Return (target_sec, generated_sec) for one language from corpus + checkpoint."""
+    lang_key = language.lower()
+    target_total = 0.0
+    generated_total = 0.0
+    for pos in _language_ordered_positions(corpus_df, run_languages):
+        row = corpus_df.iloc[pos]
+        if str(row.get("language", "")).lower() != lang_key:
+            continue
+        inst_target = float(row.get("duration_sec") or 0.0)
+        target_total += inst_target
+        if checkpoint is not None:
+            inst_id = int(row["corpus_combination_id"])
+            generated_total += checkpoint.get(inst_id, inst_target).generated_sec
+    return target_total, generated_total
 
 
 # ------------------------------------------------------------------ #
@@ -310,6 +442,7 @@ class ConversationRunner:
             agent_emotion=profile.get("agent_emotion"),
             user_emotion=profile.get("user_emotion"),
             language=profile.get("language"),
+            target_duration_sec=target_duration_sec,
         )
         return transcript, turns
 
@@ -332,45 +465,13 @@ class ConversationRunner:
     # ------------------------------------------------------------------ #
     # Entry point
     # ------------------------------------------------------------------ #
-    def run(self, **profile: Any) -> dict[str, Any]:
-        """Run the full pipeline with a content gate before formatting.
-
-        Flow::
-
-            topic = generate_topic()
-
-            # Stage 2+3: generate a transcript and CONTENT-validate it. The
-            # transcript is only handed on once the content judge PASSES.
-            for gen_attempt in range(max_generation_attempts):
-                transcript = generator_agent(...)
-                if content_validator(transcript) PASSES: break
-                # else feed the content feedback + previous transcript back to
-                # the GENERATOR and regenerate
-            else:
-                return failure  # never passed content validation → not formatted
-
-            # Stage 4: format the APPROVED transcript, then validate the
-            # formatting only (deterministic timing + LLM faithfulness).
-            for fmt_attempt in range(max_format_attempts):
-                turns = formatter_agent(transcript, ...)
-                if manual_validation(turns) fails: re-format; continue
-                if format_validator(transcript, turns) PASSES: done
-                # else the formatter was unfaithful → re-format (transcript kept)
-
-        So content quality is fixed by **regeneration** before formatting, and the
-        post-format judge only checks faithful conversion — it never re-judges
-        accent/emotion/realism, which are already approved.
-
-        Returns
-        -------
-        dict with keys: topic, transcript, turns, manual_validation,
-            content_validation, format_validation, and retry/bypass metadata.
-        """
-        Logger.step(f"Starting pipeline for language: {profile.get('language', 'unknown')}")
-
-        # Decide ONCE per conversation whether this one is number-rich, drawn from
-        # NUMBER_INCLUSION_PERCENTAGE (default 50%). Fixed for the whole pipeline
-        # (topic + every regeneration) so the topic and dialogue stay aligned.
+    def _plan_conversation(
+        self,
+        remaining_sec: float | None = None,
+        max_overflow_sec: float = INSTANCE_OVERFLOW_TOLERANCE_SEC,
+        **profile: Any,
+    ) -> dict[str, Any]:
+        """Topic + target-duration planning phase (cheap budget gate before generation)."""
         include_numbers = random.random() < get_number_inclusion_percentage()
         Logger.info(
             f"Number inclusion: {'ON — numbers + reasoning' if include_numbers else 'OFF — qualitative'}"
@@ -379,9 +480,6 @@ class ConversationRunner:
         try:
             topic = self.generate_topic(include_numbers=include_numbers, **profile)
         except (ValueError, LLMError) as err:
-            # Topic generation exhausted its retries (e.g. the model kept returning
-            # empty/invalid JSON). Fail THIS conversation gracefully instead of
-            # crashing the whole run — process_instance counts it and moves on.
             Logger.error(f"Topic generation failed; skipping this conversation: {err}")
             return {
                 "topic": {},
@@ -406,14 +504,72 @@ class ConversationRunner:
                 "passed": False,
             }
 
-        # Draw one exact target duration for this conversation from the Gaussian
-        # so lengths follow the intended 4–8 min distribution. Sampled once and
-        # reused across all retries so every regeneration aims for the same target.
         target_duration_sec = sample_target_duration_sec()
+        if remaining_sec is not None:
+            capped = cap_target_duration_for_budget(
+                target_duration_sec,
+                remaining_sec,
+                max_overflow_sec=max_overflow_sec,
+            )
+            if capped is None:
+                Logger.info(
+                    f"Instance budget exhausted ({remaining_sec:.0f}s remaining) — "
+                    "stopping after topic (no conversation generated)."
+                )
+                return {
+                    "topic": topic,
+                    "transcript": "",
+                    "turns": [],
+                    "manual_validation": None,
+                    "content_validation": None,
+                    "format_validation": None,
+                    "content_validation_bypassed": False,
+                    "format_validation_bypassed": False,
+                    "format_validation_exhausted": False,
+                    "target_duration_sec": None,
+                    "include_numbers": include_numbers,
+                    "content_attempts_used": 0,
+                    "format_attempts_used": 0,
+                    "content_validation_attempts_used": 0,
+                    "format_validation_attempts_used": 0,
+                    "max_generation_attempts": self.max_generation_attempts,
+                    "max_format_attempts": self.max_format_attempts,
+                    "max_content_validation_retries": self.max_content_validation_retries,
+                    "max_format_validation_retries": self.max_format_validation_retries,
+                    "passed": False,
+                    "budget_exhausted": True,
+                }
+            if capped != target_duration_sec:
+                Logger.info(
+                    f"Capped conversation target {target_duration_sec:.0f}s → {capped:.0f}s "
+                    f"to fit instance budget ({remaining_sec:.0f}s remaining, "
+                    f"+{max_overflow_sec:.0f}s overflow allowed)."
+                )
+            target_duration_sec = capped
+
         Logger.info(
             f"Target conversation duration: {target_duration_sec:.1f}s "
             f"({target_duration_sec / 60:.2f} min)"
         )
+        return {
+            "topic": topic,
+            "target_duration_sec": target_duration_sec,
+            "include_numbers": include_numbers,
+        }
+
+    def _execute_conversation(
+        self,
+        plan: dict[str, Any],
+        **profile: Any,
+    ) -> dict[str, Any]:
+        """Run transcript → validation → formatting for a planned conversation."""
+        Logger.step(
+            f"Generating conversation for {profile.get('language', 'unknown')} "
+            f"(target {plan['target_duration_sec']:.0f}s)…"
+        )
+        topic = plan["topic"]
+        target_duration_sec = plan["target_duration_sec"]
+        include_numbers = plan["include_numbers"]
 
         transcript: str = ""
         content_report: ContentValidationReport | None = None
@@ -421,11 +577,9 @@ class ConversationRunner:
         content_attempts_used = 0
         content_validation_attempts_used = 0
 
-        # Feedback threaded back to the GENERATOR across regeneration attempts.
         generator_feedback: str | None = None
         previous_transcript: str | None = None
 
-        # ---- Stage 2+3: generate a transcript and gate on content validation ----
         content_ok = False
         for gen_attempt in range(1, self.max_generation_attempts + 1):
             content_attempts_used = gen_attempt
@@ -569,6 +723,7 @@ class ConversationRunner:
                     language=profile.get("language"),
                     feedback=formatter_feedback,
                     previous_output=previous_output,
+                    target_duration_sec=target_duration_sec,
                 )
             except (ValueError, LLMError) as err:
                 Logger.warning(f"Formatting failed: {err}")
@@ -618,6 +773,8 @@ class ConversationRunner:
             edit_result = self._repair_by_editing(turns, transcript, format_report, profile)
             if edit_result is not None:
                 turns, edited_manual, edited_format = edit_result
+                turns = self.formatter_agent.scale_timings_to_target(turns, target_duration_sec)
+                edited_manual = self.validate_conversation(turns)
                 manual_report = edited_manual
                 best_turns = turns
                 best_manual_report = edited_manual
@@ -686,6 +843,23 @@ class ConversationRunner:
                 and (format_ok or format_validation_exhausted)
             ),
         }
+
+    def run(
+        self,
+        remaining_sec: float | None = None,
+        max_overflow_sec: float = INSTANCE_OVERFLOW_TOLERANCE_SEC,
+        **profile: Any,
+    ) -> dict[str, Any]:
+        """Run the full pipeline with a content gate before formatting."""
+        Logger.step(f"Starting pipeline for language: {profile.get('language', 'unknown')}")
+        plan = self._plan_conversation(
+            remaining_sec=remaining_sec,
+            max_overflow_sec=max_overflow_sec,
+            **profile,
+        )
+        if plan.get("budget_exhausted") or plan.get("passed") is False:
+            return plan
+        return self._execute_conversation(plan, **profile)
 
     # ------------------------------------------------------------------ #
     # Validation helpers
@@ -1080,6 +1254,10 @@ def save_token_usage_metadata(
             except StorageError as err:
                 Logger.warning(f"Failed to upload token usage metadata to storage: {err}")
 
+        # Emit the same totals to W&B — input/output/cache tokens per model,
+        # plotted as one line per model over the run.
+        wandb_logger.log_token_usage(summary)
+
     return meta_path
 
 
@@ -1129,6 +1307,9 @@ def process_instance(
     checkpoint: Checkpoint | None = None,
     max_conversations: int | None = None,
     skipped: SkippedRegistry | None = None,
+    *,
+    language_target_sec: float | None = None,
+    language_generated_sec: float | None = None,
 ) -> float:
     """Generate conversations for one instance until its target duration is met.
 
@@ -1164,6 +1345,21 @@ def process_instance(
     else:
         progress = InstanceProgress(instance.corpus_combination_id, target_sec)
 
+    if progress.generated_sec >= target_sec:
+        Logger.info(
+            f"Instance {instance.corpus_combination_id} already at target "
+            f"({progress.generated_sec:.0f}/{target_sec:.0f}s) — skipping."
+        )
+        return progress.generated_sec
+
+    overflow_now = progress.generated_sec - target_sec
+    if overflow_now > INSTANCE_OVERFLOW_TOLERANCE_SEC:
+        Logger.warning(
+            f"Instance {instance.corpus_combination_id} is {overflow_now:.0f}s over target "
+            f"({progress.generated_sec:.0f}/{target_sec:.0f}s) — skipping further generation."
+        )
+        return progress.generated_sec
+
     Logger.step(
         f"Instance {instance.corpus_combination_id} "
         f"[{instance.language} | {instance.gender_pair}] — "
@@ -1190,10 +1386,24 @@ def process_instance(
     # for THIS instance at the same time. Topic generation is serialised inside
     # the topic agent, so parallel workers never produce a clashing topic.
     workers = get_num_workers()
+    budget = GenerationBudget(
+        instance_target_sec=target_sec,
+        instance_generated_sec=progress.generated_sec,
+        language_target_sec=language_target_sec,
+        language_generated_sec=language_generated_sec,
+    )
     if workers > 1:
         Logger.info(
             f"Parallel generation: {workers} worker(s) for instance "
-            f"{instance.corpus_combination_id}."
+            f"{instance.corpus_combination_id} "
+            f"(instance headroom {budget.instance_headroom():.0f}s, "
+            f"language headroom {budget.language_headroom():.0f}s)."
+        )
+    if language_target_sec is not None:
+        Logger.info(
+            f"Language budget [{instance.language}]: "
+            f"{language_generated_sec or 0:.0f}/{language_target_sec:.0f}s committed "
+            f"(+{budget.reserved_sec:.0f}s reserved in-flight when workers run)."
         )
 
     # Shared state mutated by every worker, guarded by ``lock``. ``stop`` signals
@@ -1212,18 +1422,116 @@ def process_instance(
             return False
         if max_conversations is not None and shared["accepted"] >= max_conversations:
             return False
-        return True
+        return budget.effective_headroom() >= MIN_VIABLE_CONVERSATION_SEC
 
     def worker(worker_id: int) -> None:
+        profile = instance.to_profile()
         while True:
+            provisional_id: str | None = None
+            headroom_snapshot = 0.0
             with lock:
                 if not _should_start():
                     return
+                headroom_snapshot = budget.effective_headroom()
+                # Gate entry into topic generation (an LLM call) with a
+                # conservative reservation FIRST. With NUM_WORKERS possibly far
+                # exceeding what an instance/language can still absorb (e.g.
+                # 1000 workers, 12 conversations left), this caps how many
+                # threads plan concurrently to roughly
+                # ``headroom / DURATION_MIN_SEC`` — the rest see no headroom
+                # left and skip straight to the next instance instead of
+                # burning an API call that would just be discarded. In the
+                # final stretch (< 1 full conversation of budget left), reserve
+                # exactly what's left so one worker can still produce a short
+                # closing conversation instead of everyone giving up.
+                provisional_amount = min(DURATION_MIN_SEC, headroom_snapshot)
+                provisional_id = budget.reserve(provisional_amount, worker_id)
+                if provisional_id is None:
+                    if headroom_snapshot < MIN_VIABLE_CONVERSATION_SEC:
+                        stop.set()
+                    return
 
-            # Heavy pipeline runs OUTSIDE the lock so workers overlap; only the
-            # topic step is internally serialised (guaranteeing unique topics).
+            Logger.step(
+                f"Worker {worker_id}: planning conversation for instance "
+                f"{instance.corpus_combination_id} "
+                f"({headroom_snapshot:.0f}s headroom before topic)."
+            )
+            plan = runner._plan_conversation(
+                remaining_sec=headroom_snapshot,
+                # ``headroom_snapshot`` already includes the instance/language
+                # overflow tolerance (baked into GenerationBudget), so don't
+                # let the planner add it again on top — that would let a
+                # conversation's cap drift to double the intended overshoot.
+                max_overflow_sec=0.0,
+                **profile,
+            )
+
+            if plan.get("budget_exhausted"):
+                with lock:
+                    budget.release(provisional_id)
+                    stop.set()
+                Logger.info(
+                    f"Worker {worker_id}: instance budget exhausted after topic — exiting."
+                )
+                return
+
+            if not plan.get("target_duration_sec"):
+                abort = False
+                with lock:
+                    budget.release(provisional_id)
+                    shared["consecutive_failures"] += 1
+                    cf = shared["consecutive_failures"]
+                    if cf >= MAX_CONSECUTIVE_FAILURES and not stop.is_set():
+                        stop.set()
+                        abort = True
+                wandb_logger.RUN_STATS.record_conversation(accepted=False)
+                wandb_logger.log_progress(
+                    consecutive_failures=cf,
+                    instance_id=instance.corpus_combination_id,
+                )
+                Logger.error(
+                    f"Topic/planning failed (worker {worker_id}; "
+                    f"consecutive failures: {cf}/{MAX_CONSECUTIVE_FAILURES})."
+                )
+                if abort:
+                    Logger.error(
+                        f"Aborting instance {instance.corpus_combination_id}: "
+                        f"{MAX_CONSECUTIVE_FAILURES} consecutive failures."
+                    )
+                    _record_skipped_instance(
+                        storage, skipped, instance, progress, target_sec, cf
+                    )
+                    return
+                continue
+
+            planned_sec = float(plan["target_duration_sec"])
+            reservation_id: str | None = None
+            with lock:
+                # Swap the conservative provisional reservation for the real
+                # planned duration now that topic generation revealed it.
+                budget.release(provisional_id)
+                if not budget.can_accommodate(planned_sec):
+                    Logger.info(
+                        f"Worker {worker_id}: instance/language budget full — "
+                        f"planned {planned_sec:.0f}s but only "
+                        f"{budget.effective_headroom():.0f}s headroom "
+                        f"(instance {budget.instance_headroom():.0f}s, "
+                        f"language {budget.language_headroom():.0f}s, "
+                        f"HF+reserved {budget.instance_generated_sec + budget.reserved_sec:.0f}s "
+                        f"/ {budget.instance_target_sec:.0f}s) — exiting."
+                    )
+                    if budget.effective_headroom() < MIN_VIABLE_CONVERSATION_SEC:
+                        stop.set()
+                    return
+                reservation_id = budget.reserve(planned_sec, worker_id)
+
             try:
-                result = runner.run(**instance.to_profile())
+                try:
+                    result = runner._execute_conversation(plan, **profile)
+                finally:
+                    with lock:
+                        budget.release(reservation_id)
+                        reservation_id = None
             except APILimitError as err:
                 with lock:
                     shared["api_limit_err"] = err
@@ -1257,6 +1565,11 @@ def process_instance(
                     if cf >= MAX_CONSECUTIVE_FAILURES and not stop.is_set():
                         stop.set()
                         abort = True
+                wandb_logger.RUN_STATS.record_conversation(accepted=False)
+                wandb_logger.log_progress(
+                    consecutive_failures=cf,
+                    instance_id=instance.corpus_combination_id,
+                )
                 Logger.error(
                     f"Conversation failed validation (worker {worker_id}; "
                     f"consecutive failures: {cf}/{MAX_CONSECUTIVE_FAILURES})."
@@ -1275,10 +1588,20 @@ def process_instance(
             # ---- accepted ----
             topic_title = (result.get("topic") or {}).get("title") or None
             with lock:
-                # A late abort/limit may have fired while we were generating; if so,
-                # drop this result rather than recording past the stop point.
-                if stop.is_set():
+                if progress.generated_sec >= target_sec + INSTANCE_OVERFLOW_TOLERANCE_SEC:
                     return
+
+                new_total = progress.generated_sec + duration
+                if new_total > target_sec + INSTANCE_OVERFLOW_TOLERANCE_SEC:
+                    Logger.warning(
+                        f"Rejecting conversation (+{duration:.0f}s would reach "
+                        f"{new_total:.0f}s, {new_total - target_sec:.0f}s over target "
+                        f"{target_sec:.0f}s — max allowed overflow "
+                        f"{INSTANCE_OVERFLOW_TOLERANCE_SEC:.0f}s)."
+                    )
+                    stop.set()
+                    return
+
                 # Assign the file index atomically from the persisted count so
                 # parallel saves never collide or leave gaps.
                 index = progress.conversation_count + 1
@@ -1327,6 +1650,17 @@ def process_instance(
 
                 shared["consecutive_failures"] = 0
                 shared["accepted"] += 1
+                budget.commit(duration)
+                if progress.generated_sec >= target_sec:
+                    stop.set()
+
+            wandb_logger.RUN_STATS.record_conversation(accepted=True)
+            wandb_logger.log_progress(
+                instance_id=instance.corpus_combination_id,
+                instance_generated_sec=progress.generated_sec,
+                instance_target_sec=target_sec,
+                duration_sec=duration,
+            )
 
     if workers == 1:
         worker(1)
@@ -1344,6 +1678,9 @@ def process_instance(
     # the checkpoint and stops); re-raise it now that all workers have stopped.
     if shared["api_limit_err"] is not None:
         raise shared["api_limit_err"]
+
+    wandb_logger.RUN_STATS.record_instance_complete()
+    wandb_logger.log_progress(instance_id=instance.corpus_combination_id)
 
     Logger.success(
         f"Instance {instance.corpus_combination_id} complete: "
@@ -1372,6 +1709,112 @@ def _language_ordered_positions(
     for lang in run_languages:
         positions.extend(pos for pos in range(len(corpus_df)) if lang_of.iloc[pos] == lang)
     return positions
+
+
+def _instance_progress_state(
+    instance: CorpusInstance,
+    checkpoint: Checkpoint | None,
+) -> tuple[str, InstanceProgress]:
+    """Classify checkpoint progress as ``complete``, ``incomplete``, or ``not_started``."""
+    target_sec = instance.duration_sec or 0.0
+    if checkpoint is not None:
+        progress = checkpoint.get(instance.corpus_combination_id, target_sec)
+    else:
+        progress = InstanceProgress(instance.corpus_combination_id, target_sec)
+
+    if progress.generated_sec >= target_sec:
+        if progress.generated_sec > target_sec + INSTANCE_OVERFLOW_TOLERANCE_SEC:
+            return "over_target", progress
+        return "complete", progress
+    if progress.conversation_count > 0 or progress.generated_sec > 0:
+        return "incomplete", progress
+    return "not_started", progress
+
+
+def _plan_production_run(
+    corpus_df: Any,
+    run_languages: list[str] | None,
+    checkpoint: Checkpoint | None,
+    skipped: SkippedRegistry | None,
+) -> tuple[list[int], dict[str, Any]]:
+    """Order instances: incomplete first, then not started; skip complete/skipped."""
+    positions = _language_ordered_positions(corpus_df, run_languages)
+    incomplete: list[int] = []
+    not_started: list[int] = []
+    complete_count = 0
+    over_target_count = 0
+    skipped_count = 0
+    lang_stats: dict[str, dict[str, int]] = {}
+
+    for pos in positions:
+        row = corpus_df.iloc[pos]
+        instance = CorpusInstance.from_dict({str(k): v for k, v in row.to_dict().items()})
+        lang = str(row.get("language", "")).lower()
+
+        if skipped is not None and instance.corpus_combination_id in skipped:
+            skipped_count += 1
+            continue
+
+        state, progress = _instance_progress_state(instance, checkpoint)
+        stats = lang_stats.setdefault(
+            lang,
+            {"total": 0, "incomplete": 0, "not_started": 0, "complete": 0, "over_target": 0},
+        )
+        stats["total"] += 1
+        stats[state] += 1
+
+        if state == "complete":
+            complete_count += 1
+        elif state == "over_target":
+            over_target_count += 1
+        elif state == "incomplete":
+            incomplete.append(pos)
+        else:
+            not_started.append(pos)
+
+    ordered = incomplete + not_started
+    summary = {
+        "total_in_corpus": len(positions),
+        "to_process": len(ordered),
+        "complete": complete_count,
+        "over_target": over_target_count,
+        "skipped": skipped_count,
+        "incomplete": len(incomplete),
+        "not_started": len(not_started),
+        "by_language": lang_stats,
+    }
+    return ordered, summary
+
+
+def _log_run_plan(summary: dict[str, Any], run_languages: list[str] | None) -> None:
+    """Log language/instance counts and the incomplete-first processing order."""
+    langs = ", ".join(run_languages) if run_languages else "all"
+    Logger.step(
+        f"Run plan — languages: {langs} | "
+        f"{summary['to_process']} instance(s) to process "
+        f"({summary['incomplete']} incomplete, {summary['not_started']} not started)"
+    )
+    if summary["complete"]:
+        Logger.info(
+            f"Skipping {summary['complete']} already-complete instance(s) "
+            f"out of {summary['total_in_corpus']} in scope."
+        )
+    if summary.get("over_target"):
+        Logger.warning(
+            f"Skipping {summary['over_target']} over-target instance(s) "
+            f"(generated past target by more than {INSTANCE_OVERFLOW_TOLERANCE_SEC:.0f}s)."
+        )
+    if summary["skipped"]:
+        Logger.info(f"Skipping {summary['skipped']} abandoned instance(s) in skipped.json.")
+    for lang, stats in sorted(summary["by_language"].items()):
+        Logger.info(
+            f"  {lang}: {stats['total']} total — "
+            f"{stats['incomplete']} incomplete, {stats['not_started']} not started, "
+            f"{stats['complete']} complete"
+            + (f", {stats['over_target']} over target" if stats.get("over_target") else "")
+        )
+    if summary["incomplete"]:
+        Logger.info("Processing order: incomplete instances first, then not started.")
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -1469,6 +1912,17 @@ def _get_runner(
 
 
 def main(argv: list[str] | None = None) -> None:
+    """Entry point: run the pipeline, always closing the W&B run on exit."""
+    try:
+        _main_impl(argv)
+    finally:
+        # Always finalize the W&B run — even on an early return (language
+        # validation failure, empty instance list, API-limit termination) or
+        # an uncaught exception — so a run is never left dangling as "crashed".
+        wandb_logger.finish_run()
+
+
+def _main_impl(argv: list[str] | None = None) -> None:
     # Load API keys / settings from conversations_generator/config.json and
     # mirror them into os.environ for any third-party SDK that only reads env.
     apply_to_environ()
@@ -1516,6 +1970,18 @@ def main(argv: list[str] | None = None) -> None:
         f"{hindi_note}, validation/formatter(--validation-model)={args.validation_model}"
     )
 
+    # One W&B run per process invocation — logs token usage (input/output/cache,
+    # per model) and conversation/instance progress for the rest of this run.
+    wandb_logger.init_run(
+        {
+            "mode": get_mode(),
+            "language_filter": run_languages,
+            "generation_provider": args.model or DEFAULT_GENERATION_PROVIDER.value,
+            "validation_provider": args.validation_model,
+            "num_workers": get_num_workers(),
+        }
+    )
+
     # Runners are cached by (generation_provider, validation_provider) because
     # generation can differ per instance (Hindi → Sarvam) while validation is
     # fixed for the whole CLI invocation.
@@ -1536,14 +2002,17 @@ def main(argv: list[str] | None = None) -> None:
         Logger.info(
             f"Loaded skipped registry with {len(skipped.instances)} abandoned instance(s)."
         )
-        # Process every instance of each requested language in turn (English
-        # fully, then Hindi, …). Resume is automatic: an instance already at its
-        # duration target in the checkpoint is a no-op, so re-running a language
-        # only finishes the instances left over from a previous run.
-        indices = _language_ordered_positions(corpus_df, run_languages)
-        Logger.step(
-            f"PRODUCTION run — processing {len(indices)} instance(s) in sequence."
+        # Process every instance of each requested language in turn. Resume is
+        # automatic via the checkpoint; incomplete instances are scheduled first.
+        indices, run_plan = _plan_production_run(
+            corpus_df, run_languages, checkpoint, skipped
         )
+        _log_run_plan(run_plan, run_languages)
+        if not indices:
+            Logger.success(
+                "All instances already complete for the requested languages — nothing to do."
+            )
+            return
     else:
         Logger.step("DEVELOPMENT run — generating a single conversation per instance (no upload).")
         # Hand-picked smoke tests spanning every language for variety.
@@ -1586,6 +2055,8 @@ def main(argv: list[str] | None = None) -> None:
         )
         return
 
+    wandb_logger.RUN_STATS.set_total_instances(len(indices))
+
     for i in indices:
         row: dict[str, Any] = {str(k): v for k, v in corpus_df.iloc[i].to_dict().items()}
         instance = CorpusInstance.from_dict(row)
@@ -1599,8 +2070,23 @@ def main(argv: list[str] | None = None) -> None:
             )
             continue
         runner = _get_runner(runner_cache, args.model, args.validation_model, instance.language)
+        lang_target, lang_generated = _language_budget_totals(
+            corpus_df,
+            checkpoint,
+            run_languages,
+            instance.language,
+        )
         try:
-            process_instance(runner, instance, storage, checkpoint, max_conversations, skipped)
+            process_instance(
+                runner,
+                instance,
+                storage,
+                checkpoint,
+                max_conversations,
+                skipped,
+                language_target_sec=lang_target,
+                language_generated_sec=lang_generated,
+            )
         except APILimitError:
             Logger.error(
                 "Terminating run: API rate-limit or quota exceeded. "

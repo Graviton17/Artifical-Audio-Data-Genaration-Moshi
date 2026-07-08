@@ -125,7 +125,9 @@ class KrutrimLLM(BaseLLM):
         usage = data.get("usage")
         if not usage:
             return {}
+        cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
         return {
             "input": usage.get("prompt_tokens", 0) or 0,
             "output": usage.get("completion_tokens", 0) or 0,
+            "cache": cached or 0,
         }

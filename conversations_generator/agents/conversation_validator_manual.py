@@ -396,10 +396,10 @@ class ConversationValidatorManual:
             duration = max(ends) - min(starts)
             report.duration_sec = duration
             if not (self.min_duration_sec <= duration <= self.max_duration_sec):
-                report.warn(
+                report.error(
                     "<conversation>",
                     f"Total duration is {duration:.1f}s ({duration / 60:.1f} min) — outside "
-                    f"the target {self.min_duration_sec / 60:.0f}-{self.max_duration_sec / 60:.0f} "
+                    f"the required {self.min_duration_sec / 60:.0f}-{self.max_duration_sec / 60:.0f} "
                     f"min range.",
                 )
 
