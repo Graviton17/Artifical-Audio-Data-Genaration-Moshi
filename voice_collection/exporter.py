@@ -20,7 +20,7 @@ import re
 from pathlib import Path
 
 from .models import Language, SpeakerSelection
-from .processing import AudioProcessingError, export_audio
+from .processing.audio_codec import AudioProcessingError, export_audio
 
 logger = logging.getLogger(__name__)
 
